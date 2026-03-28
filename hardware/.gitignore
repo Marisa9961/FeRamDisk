@@ -1,0 +1,18 @@
+*
+
+# necessary
+!*/
+!.gitignore
+!.gitattributes
+
+# project
+!*.kicad_pro
+!*.kicad_pcb
+!*.kicad_sch
+
+# library
+!*.kicad_sym
+!*.kicad_mod
+
+# README
+!README.md

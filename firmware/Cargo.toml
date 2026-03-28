@@ -1,0 +1,23 @@
+[package]
+name = "feramdisk-firmware"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "feramdisk-firmware"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+cortex-m = "0.7.7"
+cortex-m-rt = "0.7.5"
+panic-halt = "1.0.0"
+stm32g4xx-hal = { version = "0.1.0", features = ["stm32g431", "rt"] }
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"

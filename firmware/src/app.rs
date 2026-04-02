@@ -1,6 +1,7 @@
 use crate::storage::Storage;
 use crate::usb_msc::MscStack;
 use stm32g4xx_hal as hal;
+use rtt_target::{rprintln, rtt_init_print};
 
 use hal::prelude::*;
 use hal::pwr::PwrExt;
@@ -9,6 +10,9 @@ use hal::stm32;
 use hal::time::ExtU32;
 
 pub fn run() -> ! {
+    rtt_init_print!();
+    rprintln!("System starting...");
+
     let dp = stm32::Peripherals::take().expect("cannot take device peripherals");
     let cp = cortex_m::Peripherals::take().expect("cannot take core peripherals");
 
@@ -24,6 +28,8 @@ pub fn run() -> ! {
     let mut msc = MscStack::new();
     let mut led_on = false;
 
+    rprintln!("Hardware initialized. Entering main loop.");
+
     loop {
         storage.poll();
         msc.poll(&mut storage);
@@ -37,6 +43,7 @@ pub fn run() -> ! {
             let _ = led1.set_high();
         }
 
-        delay.delay(250.millis());
+        rprintln!("Heartbeat - LED ON: {}", led_on);
+        delay.delay(1000.millis());
     }
 }

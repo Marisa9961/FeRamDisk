@@ -1,14 +1,14 @@
 #![no_std]
 #![no_main]
 
-use cortex_m_rt::entry;
+use embassy_executor::Spawner;
 use panic_halt as _;
 
 mod app;
 mod storage;
 mod usb_msc;
 
-#[entry]
-fn main() -> ! {
-    app::run()
+#[embassy_executor::main]
+async fn main(_spawner: Spawner) {
+    app::run().await;
 }

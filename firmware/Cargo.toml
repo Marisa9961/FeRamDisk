@@ -10,11 +10,13 @@ test = false
 bench = false
 
 [dependencies]
-cortex-m = "0.7.7"
+cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7.5"
+embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "executor-interrupt"] }
+embassy-stm32 = { version = "0.6.0", features = ["stm32g431cb", "time-driver-any", "exti", "memory-x"] }
+embassy-time = "0.5.1"
 panic-halt = "1.0.0"
 rtt-target = "0.6.2"
-stm32g4xx-hal = { version = "0.1.0", features = ["stm32g431", "rt"] }
 
 [profile.dev]
 panic = "abort"

@@ -484,8 +484,11 @@ dependencies = [
  "cortex-m",
  "cortex-m-rt",
  "embassy-executor",
+ "embassy-futures",
  "embassy-stm32",
  "embassy-time",
+ "embassy-usb-driver",
+ "embedded-hal 1.0.0",
  "panic-halt",
  "rtt-target",
 ]

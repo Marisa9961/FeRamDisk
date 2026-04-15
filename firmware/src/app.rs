@@ -1,4 +1,4 @@
-use crate::feram::FeRam;
+use crate::feram::{self, FeRam};
 use crate::init;
 use crate::spi::FramSpi;
 use crate::usb;
@@ -21,7 +21,7 @@ pub async fn run() {
     let p: Peripherals = init::init();
 
     let mut spi_cfg = spi::Config::default();
-    spi_cfg.frequency = Hertz(20_000_000);
+    spi_cfg.frequency = Hertz(4_000_000);
     let spi = Spi::new(
         p.SPI1,
         p.PA5,
@@ -42,6 +42,19 @@ pub async fn run() {
     let mut fram = FeRam::new(fram_spi);
 
     rprintln!("FeRAM capacity: {} blocks", fram.block_count());
+
+    rprintln!("FRAM Device ID Check");
+    for chip_idx in 0..feram::CHIP_COUNT {
+        match fram.read_id(chip_idx).await {
+            Ok(id) => {
+                rprintln!("Chip {}: Device ID = 0x{:02X}{:02X}{:02X}",
+                    chip_idx, id[0], id[1], id[2]);
+            }
+            Err(e) => {
+                rprintln!("Chip {}: ID read failed - {:?}", chip_idx, e);
+            }
+        }
+    }
 
     match fram.ensure_mass_storage_volume().await {
         Ok(true) => rprintln!("Initialized FAT12 volume for Windows"),

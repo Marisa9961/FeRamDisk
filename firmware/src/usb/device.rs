@@ -5,6 +5,7 @@ use core::cmp::min;
 use crate::usb::msc::{self, BlockStorage};
 use embassy_futures::join::join;
 use embassy_futures::select::{select, Either};
+use embassy_time::Timer;
 use embassy_usb_driver::{self as driver, Endpoint, EndpointAddress, EndpointType, Event};
 
 const USB_VID: u16 = 0x1209;
@@ -69,10 +70,11 @@ where
     let descriptors = UsbDescriptors::new(bulk_out_addr, bulk_in_addr);
 
     let (bus, control) = driver.start(CONTROL_MAX_PACKET_SIZE);
+    let bot_control = msc::BotControl::new();
 
     join(
-        control_task(bus, control, descriptors, bulk_out_addr, bulk_in_addr),
-        msc::run(bulk_out, bulk_in, storage),
+        control_task(bus, control, descriptors, bulk_out_addr, bulk_in_addr, &bot_control),
+        msc::run(bulk_out, bulk_in, storage, &bot_control),
     )
     .await;
 }
@@ -83,6 +85,7 @@ async fn control_task<B, C>(
     descriptors: UsbDescriptors,
     bulk_out_addr: EndpointAddress,
     bulk_in_addr: EndpointAddress,
+    bot_control: &msc::BotControl,
 ) where
     B: driver::Bus,
     C: driver::ControlPipe,
@@ -90,18 +93,21 @@ async fn control_task<B, C>(
     let mut configuration: u8 = 0;
 
     loop {
-        match select(bus.poll(), control.setup()).await {
-            Either::First(event) => match event {
+        apply_pending_bot_actions(&mut bus, bulk_out_addr, bulk_in_addr, bot_control);
+
+        match select(select(bus.poll(), control.setup()), Timer::after_millis(1)).await {
+            Either::First(Either::First(event)) => match event {
                 Event::Reset => {
                     configuration = 0;
                     bus.endpoint_set_enabled(bulk_out_addr, false);
                     bus.endpoint_set_enabled(bulk_in_addr, false);
                     bus.endpoint_set_stalled(bulk_out_addr, false);
                     bus.endpoint_set_stalled(bulk_in_addr, false);
+                    bot_control.signal_bulk_reset();
                 }
                 Event::Suspend | Event::Resume | Event::PowerDetected | Event::PowerRemoved => {}
             },
-            Either::Second(setup) => {
+            Either::First(Either::Second(setup)) => {
                 handle_setup(
                     &mut bus,
                     &mut control,
@@ -110,10 +116,62 @@ async fn control_task<B, C>(
                     &mut configuration,
                     bulk_out_addr,
                     bulk_in_addr,
+                    bot_control,
                 )
                 .await;
             }
+            Either::Second(_) => {}
         }
+
+        apply_pending_bot_actions(&mut bus, bulk_out_addr, bulk_in_addr, bot_control);
+    }
+}
+
+fn apply_pending_bot_actions<B>(
+    bus: &mut B,
+    bulk_out_addr: EndpointAddress,
+    bulk_in_addr: EndpointAddress,
+    bot_control: &msc::BotControl,
+) where
+    B: driver::Bus,
+{
+    let actions = bot_control.take_bus_actions();
+
+    if actions & msc::BOT_ACTION_STALL_OUT != 0 {
+        bus.endpoint_set_stalled(bulk_out_addr, true);
+    }
+
+    if actions & msc::BOT_ACTION_STALL_IN != 0 {
+        bus.endpoint_set_stalled(bulk_in_addr, true);
+    }
+}
+
+fn reset_bulk_endpoints<B>(
+    bus: &mut B,
+    configuration: u8,
+    bulk_out_addr: EndpointAddress,
+    bulk_in_addr: EndpointAddress,
+) where
+    B: driver::Bus,
+{
+    let enabled = configuration == CONFIGURATION_VALUE;
+
+    // BOT Reset requires clearing endpoint halt and re-synchronizing data toggle.
+    // The generic embassy-usb-driver Bus trait has no explicit "reset toggle"
+    // primitive, so we perform the most portable sequence: clear STALL +
+    // disable/enable endpoints.
+    //
+    // Risk: if a backend does not reset data PID on this sequence internally,
+    // host/device may still see PID mismatch until the next bus reset.
+    bus.endpoint_set_stalled(bulk_out_addr, false);
+    bus.endpoint_set_stalled(bulk_in_addr, false);
+
+    bus.endpoint_set_enabled(bulk_out_addr, false);
+    bus.endpoint_set_enabled(bulk_in_addr, false);
+
+    if enabled {
+        bus.endpoint_set_enabled(bulk_out_addr, true);
+        bus.endpoint_set_enabled(bulk_in_addr, true);
     }
 }
 
@@ -125,6 +183,7 @@ async fn handle_setup<B, C>(
     configuration: &mut u8,
     bulk_out_addr: EndpointAddress,
     bulk_in_addr: EndpointAddress,
+    bot_control: &msc::BotControl,
 ) where
     B: driver::Bus,
     C: driver::ControlPipe,
@@ -140,7 +199,18 @@ async fn handle_setup<B, C>(
             bulk_in_addr,
         )
         .await,
-        0x20 => handle_class_request(control, setup).await,
+        0x20 => {
+            handle_class_request(
+                bus,
+                control,
+                setup,
+                *configuration,
+                bulk_out_addr,
+                bulk_in_addr,
+                bot_control,
+            )
+            .await
+        }
         _ => control.reject().await,
     }
 }
@@ -263,8 +333,17 @@ async fn handle_standard_request<B, C>(
     }
 }
 
-async fn handle_class_request<C>(control: &mut C, setup: SetupPacket)
+async fn handle_class_request<B, C>(
+    bus: &mut B,
+    control: &mut C,
+    setup: SetupPacket,
+    configuration: u8,
+    bulk_out_addr: EndpointAddress,
+    bulk_in_addr: EndpointAddress,
+    bot_control: &msc::BotControl,
+)
 where
+    B: driver::Bus,
     C: driver::ControlPipe,
 {
     match setup.request {
@@ -272,8 +351,17 @@ where
             let value = [0u8];
             control.data_in(&value, true, true).await.ok();
         }
-        0xFF if setup.request_type == 0x21 && setup.index == INTERFACE_NUMBER as u16 => {
+        0xFF
+            if setup.request_type == 0x21
+                && setup.index == INTERFACE_NUMBER as u16
+                && setup.value == 0
+                && setup.length == 0 =>
+        {
             control.accept().await;
+            bus.endpoint_set_stalled(bulk_out_addr, false);
+            bus.endpoint_set_stalled(bulk_in_addr, false);
+            reset_bulk_endpoints(bus, configuration, bulk_out_addr, bulk_in_addr);
+            bot_control.signal_bulk_reset();
         }
         _ => control.reject().await,
     }

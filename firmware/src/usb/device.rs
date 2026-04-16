@@ -2,7 +2,9 @@
 
 use core::cmp::min;
 
-use crate::usb::msc::{self, BlockStorage};
+use crate::usb::constants::{BOT_ACTION_STALL_IN, BOT_ACTION_STALL_OUT};
+use crate::usb::core as msc;
+use crate::usb::storage::BlockStorage;
 use embassy_futures::join::join;
 use embassy_futures::select::{select, Either};
 use embassy_time::Timer;
@@ -137,11 +139,11 @@ fn apply_pending_bot_actions<B>(
 {
     let actions = bot_control.take_bus_actions();
 
-    if actions & msc::BOT_ACTION_STALL_OUT != 0 {
+    if actions & BOT_ACTION_STALL_OUT != 0 {
         bus.endpoint_set_stalled(bulk_out_addr, true);
     }
 
-    if actions & msc::BOT_ACTION_STALL_IN != 0 {
+    if actions & BOT_ACTION_STALL_IN != 0 {
         bus.endpoint_set_stalled(bulk_in_addr, true);
     }
 }

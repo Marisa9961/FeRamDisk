@@ -16,8 +16,6 @@ bind_interrupts!(struct Irqs {
 
 pub async fn run() {
     rtt_init_print!();
-    rprintln!("Embassy app start");
-
     let p: Peripherals = init::init();
 
     let mut spi_cfg = spi::Config::default();
@@ -43,7 +41,6 @@ pub async fn run() {
 
     rprintln!("FeRAM capacity: {} blocks", fram.block_count());
 
-    rprintln!("FRAM Device ID Check");
     for chip_idx in 0..feram::CHIP_COUNT {
         match fram.read_id(chip_idx).await {
             Ok(id) => {

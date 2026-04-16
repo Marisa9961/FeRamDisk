@@ -7,16 +7,16 @@ use embedded_hal::digital::OutputPin;
 
 pub const BLOCK_SIZE: usize = 512;
 pub const CHIP_COUNT: usize = 4;
-pub const CHIP_SIZE_BYTES: usize = 256 * 1024;
+pub const CHIP_SIZE_BYTES: usize = 32 * 1024;
 pub const TOTAL_SIZE_BYTES: usize = CHIP_COUNT * CHIP_SIZE_BYTES;
 pub const TOTAL_BLOCKS: u32 = (TOTAL_SIZE_BYTES / BLOCK_SIZE) as u32;
 
 const PARTITION_START_BLOCK: u32 = 1;
 const PARTITION_BLOCKS: u32 = TOTAL_BLOCKS - PARTITION_START_BLOCK;
-const FAT_SECTORS: u16 = 6;
+const FAT_SECTORS: u16 = 1;
 const FAT_TABLE_BYTES: usize = FAT_SECTORS as usize * BLOCK_SIZE;
-const ROOT_DIR_ENTRIES: u16 = 64;
-const ROOT_DIR_SECTORS: u16 = 4;
+const ROOT_DIR_ENTRIES: u16 = 32;
+const ROOT_DIR_SECTORS: u16 = 2;
 const RESERVED_SECTORS: u16 = 1;
 const PARTITION_TYPE_FAT12: u8 = 0x01;
 const BOOT_OEM_NAME: &[u8; 8] = b"FRAMDISK";
@@ -334,13 +334,8 @@ where
         address: u32,
         out: &mut [u8],
     ) -> Result<(), FeRamError<embassy_stm32::spi::Error, CS0::Error>> {
-        let addr = address & 0x3_FFFF;
-        let header = [
-            CMD_READ,
-            ((addr >> 16) & 0xFF) as u8,
-            ((addr >> 8) & 0xFF) as u8,
-            (addr & 0xFF) as u8,
-        ];
+        let addr = (address & 0xFFFF) as u16;
+        let header = [CMD_READ, (addr >> 8) as u8, addr as u8];
 
         self.bus.select_chip(chip).map_err(FeRamError::Bus)?;
         let spi_result = async {
@@ -359,10 +354,9 @@ where
         address: u32,
         out: &mut [u8],
     ) -> Result<(), FeRamError<embassy_stm32::spi::Error, CS0::Error>> {
-        let addr = address & 0x3_FFFF;
+        let addr = (address & 0xFFFF) as u16;
         let header = [
             CMD_FAST_READ,
-            ((addr >> 16) & 0xFF) as u8,
             ((addr >> 8) & 0xFF) as u8,
             (addr & 0xFF) as u8,
             0x00,
@@ -385,12 +379,11 @@ where
         address: u32,
         data: &[u8],
     ) -> Result<(), FeRamError<embassy_stm32::spi::Error, CS0::Error>> {
-        let addr = address & 0x3_FFFF;
+        let addr = (address & 0xFFFF) as u16;
         self.write_enable(chip).await?;
 
         let header = [
             CMD_WRITE,
-            ((addr >> 16) & 0xFF) as u8,
             ((addr >> 8) & 0xFF) as u8,
             (addr & 0xFF) as u8,
         ];
@@ -415,9 +408,11 @@ where
             return Ok(());
         }
 
-        match address.checked_add(len) {
-            Some(end) if end <= TOTAL_SIZE_BYTES => Ok(()),
-            _ => Err(FeRamError::OutOfRange),
+        let end = address.checked_add(len).ok_or(FeRamError::OutOfRange)?;
+        if end > TOTAL_SIZE_BYTES {
+            Err(FeRamError::OutOfRange)
+        } else {
+            Ok(())
         }
     }
 

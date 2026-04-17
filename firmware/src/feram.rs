@@ -12,16 +12,22 @@ pub const TOTAL_SIZE_BYTES: usize = CHIP_COUNT * CHIP_SIZE_BYTES;
 pub const TOTAL_BLOCKS: u32 = (TOTAL_SIZE_BYTES / BLOCK_SIZE) as u32;
 
 const PARTITION_START_BLOCK: u32 = 1;
-const PARTITION_BLOCKS: u32 = TOTAL_BLOCKS - PARTITION_START_BLOCK;
-const FAT_SECTORS: u16 = 1;
-const FAT_TABLE_BYTES: usize = FAT_SECTORS as usize * BLOCK_SIZE;
+const FAT_COUNT: u8 = 2;
+const FAT12_MAX_CLUSTERS: u32 = 0x0FF4;
 const ROOT_DIR_ENTRIES: u16 = 32;
-const ROOT_DIR_SECTORS: u16 = 2;
 const RESERVED_SECTORS: u16 = 1;
 const PARTITION_TYPE_FAT12: u8 = 0x01;
+const MEDIA_DESCRIPTOR: u8 = 0xF8;
 const BOOT_OEM_NAME: &[u8; 8] = b"FRAMDISK";
 const VOLUME_LABEL: &[u8; 11] = b"FERAMDISK  ";
 const FILE_SYSTEM_TYPE: &[u8; 8] = b"FAT12   ";
+
+#[derive(Copy, Clone)]
+struct Fat12Geometry {
+    sectors_per_cluster: u8,
+    fat_sectors: u16,
+    root_dir_sectors: u16,
+}
 
 const CMD_WREN: u8 = 0x06;
 const CMD_WRDI: u8 = 0x04;
@@ -158,17 +164,56 @@ where
     pub async fn ensure_mass_storage_volume(
         &mut self,
     ) -> Result<bool, FeRamError<embassy_stm32::spi::Error, CS0::Error>> {
-        if self.has_valid_volume_layout().await? {
+        self.ensure_mass_storage_volume_for_total_blocks(TOTAL_BLOCKS).await
+    }
+
+    pub async fn ensure_mass_storage_volume_for_total_blocks(
+        &mut self,
+        total_blocks: u32,
+    ) -> Result<bool, FeRamError<embassy_stm32::spi::Error, CS0::Error>> {
+        self.ensure_mass_storage_volume_for_total_blocks_at_offset(total_blocks, 0)
+            .await
+    }
+
+    pub async fn ensure_mass_storage_volume_for_total_blocks_at_offset(
+        &mut self,
+        total_blocks: u32,
+        volume_start_block: u32,
+    ) -> Result<bool, FeRamError<embassy_stm32::spi::Error, CS0::Error>> {
+        if total_blocks <= PARTITION_START_BLOCK || total_blocks > TOTAL_BLOCKS {
+            return Err(FeRamError::OutOfRange);
+        }
+
+        let end_block = volume_start_block
+            .checked_add(total_blocks)
+            .ok_or(FeRamError::OutOfRange)?;
+        if end_block > TOTAL_BLOCKS {
+            return Err(FeRamError::OutOfRange);
+        }
+
+        let partition_blocks = total_blocks - PARTITION_START_BLOCK;
+        let geometry = calculate_fat12_geometry(partition_blocks);
+
+        if self
+            .has_valid_volume_layout(volume_start_block, partition_blocks, geometry)
+            .await?
+        {
             return Ok(false);
         }
 
-        self.format_mass_storage_volume().await?;
+        self.format_mass_storage_volume(volume_start_block, partition_blocks, geometry)
+            .await?;
         Ok(true)
     }
 
-    async fn has_valid_volume_layout(&mut self) -> Result<bool, FeRamError<embassy_stm32::spi::Error, CS0::Error>> {
+    async fn has_valid_volume_layout(
+        &mut self,
+        volume_start_block: u32,
+        partition_blocks: u32,
+        geometry: Fat12Geometry,
+    ) -> Result<bool, FeRamError<embassy_stm32::spi::Error, CS0::Error>> {
         let mut mbr = [0u8; BLOCK_SIZE];
-        self.read_block(0, &mut mbr).await?;
+        self.read_block(volume_start_block, &mut mbr).await?;
 
         if mbr[510] != 0x55 || mbr[511] != 0xAA {
             return Ok(false);
@@ -183,12 +228,13 @@ where
             return Ok(false);
         }
 
-        if u32::from_le_bytes([partition[12], partition[13], partition[14], partition[15]]) != PARTITION_BLOCKS {
+        if u32::from_le_bytes([partition[12], partition[13], partition[14], partition[15]]) != partition_blocks {
             return Ok(false);
         }
 
         let mut boot_sector = [0u8; BLOCK_SIZE];
-        self.read_block(PARTITION_START_BLOCK, &mut boot_sector).await?;
+        self.read_block(volume_start_block + PARTITION_START_BLOCK, &mut boot_sector)
+            .await?;
 
         if boot_sector[510] != 0x55 || boot_sector[511] != 0xAA {
             return Ok(false);
@@ -198,42 +244,74 @@ where
             return Ok(false);
         }
 
-        if boot_sector[13] != 0x01 || u16::from_le_bytes([boot_sector[14], boot_sector[15]]) != RESERVED_SECTORS {
+        if boot_sector[13] != geometry.sectors_per_cluster
+            || u16::from_le_bytes([boot_sector[14], boot_sector[15]]) != RESERVED_SECTORS
+        {
             return Ok(false);
         }
 
-        if boot_sector[16] != 0x02 || u16::from_le_bytes([boot_sector[17], boot_sector[18]]) != ROOT_DIR_ENTRIES {
+        if boot_sector[16] != FAT_COUNT
+            || u16::from_le_bytes([boot_sector[17], boot_sector[18]]) != ROOT_DIR_ENTRIES
+        {
             return Ok(false);
         }
 
-        if u16::from_le_bytes([boot_sector[22], boot_sector[23]]) != FAT_SECTORS {
+        if boot_sector[21] != MEDIA_DESCRIPTOR {
+            return Ok(false);
+        }
+
+        if u16::from_le_bytes([boot_sector[22], boot_sector[23]]) != geometry.fat_sectors {
+            return Ok(false);
+        }
+
+        let total_sectors_16 = u16::from_le_bytes([boot_sector[19], boot_sector[20]]);
+        let total_sectors_32 = u32::from_le_bytes([boot_sector[32], boot_sector[33], boot_sector[34], boot_sector[35]]);
+        if partition_blocks <= u16::MAX as u32 {
+            if total_sectors_16 != partition_blocks as u16 {
+                return Ok(false);
+            }
+        } else if total_sectors_16 != 0 || total_sectors_32 != partition_blocks {
             return Ok(false);
         }
 
         Ok(true)
     }
 
-    async fn format_mass_storage_volume(&mut self) -> Result<(), FeRamError<embassy_stm32::spi::Error, CS0::Error>> {
-        self.write_block(0, &build_mbr()).await?;
-        self.write_block(PARTITION_START_BLOCK, &build_boot_sector()).await?;
+    async fn format_mass_storage_volume(
+        &mut self,
+        volume_start_block: u32,
+        partition_blocks: u32,
+        geometry: Fat12Geometry,
+    ) -> Result<(), FeRamError<embassy_stm32::spi::Error, CS0::Error>> {
+        self.write_block(volume_start_block, &build_mbr(partition_blocks)).await?;
+        self.write_block(
+            volume_start_block + PARTITION_START_BLOCK,
+            &build_boot_sector(partition_blocks, geometry),
+        )
+        .await?;
 
-        let fat = build_fat12_table();
-        for sector_offset in 0..FAT_SECTORS as usize {
+        for sector_offset in 0..geometry.fat_sectors as u32 {
             let mut sector = [0u8; BLOCK_SIZE];
-            let start = sector_offset * BLOCK_SIZE;
-            let end = start + BLOCK_SIZE;
-            sector.copy_from_slice(&fat[start..end]);
+            if sector_offset == 0 {
+                sector[0] = MEDIA_DESCRIPTOR;
+                sector[1] = 0xFF;
+                sector[2] = 0xFF;
+            }
 
-            let fat1_block = PARTITION_START_BLOCK + RESERVED_SECTORS as u32 + sector_offset as u32;
-            let fat2_block = PARTITION_START_BLOCK + RESERVED_SECTORS as u32 + FAT_SECTORS as u32 + sector_offset as u32;
+            let fat1_block = volume_start_block + PARTITION_START_BLOCK + RESERVED_SECTORS as u32 + sector_offset;
+            let fat2_block = fat1_block + geometry.fat_sectors as u32;
             self.write_block(fat1_block, &sector).await?;
             self.write_block(fat2_block, &sector).await?;
         }
 
         let zero_sector = [0u8; BLOCK_SIZE];
-        for sector_index in 0..ROOT_DIR_SECTORS as u32 {
+        let root_dir_start = volume_start_block
+            + PARTITION_START_BLOCK
+            + RESERVED_SECTORS as u32
+            + geometry.fat_sectors as u32 * FAT_COUNT as u32;
+        for sector_index in 0..geometry.root_dir_sectors as u32 {
             self.write_block(
-                PARTITION_START_BLOCK + RESERVED_SECTORS as u32 + (FAT_SECTORS as u32 * 2) + sector_index,
+                root_dir_start + sector_index,
                 &zero_sector,
             )
             .await?;
@@ -428,7 +506,7 @@ where
     }
 }
 
-fn build_mbr() -> [u8; BLOCK_SIZE] {
+fn build_mbr(partition_blocks: u32) -> [u8; BLOCK_SIZE] {
     let mut sector = [0u8; BLOCK_SIZE];
     sector[446] = 0x00;
     sector[447] = 0x01;
@@ -439,30 +517,35 @@ fn build_mbr() -> [u8; BLOCK_SIZE] {
     sector[452] = 0xFF;
     sector[453] = 0xFF;
     sector[454..458].copy_from_slice(&PARTITION_START_BLOCK.to_le_bytes());
-    sector[458..462].copy_from_slice(&PARTITION_BLOCKS.to_le_bytes());
+    sector[458..462].copy_from_slice(&partition_blocks.to_le_bytes());
     sector[510] = 0x55;
     sector[511] = 0xAA;
     sector
 }
 
-fn build_boot_sector() -> [u8; BLOCK_SIZE] {
+fn build_boot_sector(partition_blocks: u32, geometry: Fat12Geometry) -> [u8; BLOCK_SIZE] {
     let mut sector = [0u8; BLOCK_SIZE];
     sector[0] = 0xEB;
     sector[1] = 0x3C;
     sector[2] = 0x90;
     sector[3..11].copy_from_slice(BOOT_OEM_NAME);
     sector[11..13].copy_from_slice(&(BLOCK_SIZE as u16).to_le_bytes());
-    sector[13] = 0x01;
+    sector[13] = geometry.sectors_per_cluster;
     sector[14..16].copy_from_slice(&RESERVED_SECTORS.to_le_bytes());
-    sector[16] = 0x02;
+    sector[16] = FAT_COUNT;
     sector[17..19].copy_from_slice(&ROOT_DIR_ENTRIES.to_le_bytes());
-    sector[19..21].copy_from_slice(&(PARTITION_BLOCKS as u16).to_le_bytes());
-    sector[21] = 0xF8;
-    sector[22..24].copy_from_slice(&FAT_SECTORS.to_le_bytes());
+    if partition_blocks <= u16::MAX as u32 {
+        sector[19..21].copy_from_slice(&(partition_blocks as u16).to_le_bytes());
+        sector[32..36].copy_from_slice(&0u32.to_le_bytes());
+    } else {
+        sector[19..21].copy_from_slice(&0u16.to_le_bytes());
+        sector[32..36].copy_from_slice(&partition_blocks.to_le_bytes());
+    }
+    sector[21] = MEDIA_DESCRIPTOR;
+    sector[22..24].copy_from_slice(&geometry.fat_sectors.to_le_bytes());
     sector[24..26].copy_from_slice(&0x20u16.to_le_bytes());
     sector[26..28].copy_from_slice(&0x40u16.to_le_bytes());
     sector[28..32].copy_from_slice(&PARTITION_START_BLOCK.to_le_bytes());
-    sector[32..36].copy_from_slice(&0u32.to_le_bytes());
     sector[36] = 0x80;
     sector[38] = 0x29;
     sector[39..43].copy_from_slice(&0x4652_4d31u32.to_le_bytes());
@@ -473,10 +556,51 @@ fn build_boot_sector() -> [u8; BLOCK_SIZE] {
     sector
 }
 
-fn build_fat12_table() -> [u8; FAT_TABLE_BYTES] {
-    let mut fat = [0u8; FAT_TABLE_BYTES];
-    fat[0] = 0xF8;
-    fat[1] = 0xFF;
-    fat[2] = 0xFF;
-    fat
+fn calculate_fat12_geometry(partition_blocks: u32) -> Fat12Geometry {
+    let root_dir_sectors = ((ROOT_DIR_ENTRIES as u32) * 32).div_ceil(BLOCK_SIZE as u32) as u16;
+
+    for sectors_per_cluster in [1u8, 2, 4, 8, 16, 32, 64] {
+        let fat_sectors = calculate_fat_sectors(partition_blocks, sectors_per_cluster, root_dir_sectors);
+        let data_sectors = partition_blocks.saturating_sub(
+            RESERVED_SECTORS as u32 + FAT_COUNT as u32 * fat_sectors as u32 + root_dir_sectors as u32,
+        );
+        let cluster_count = data_sectors / sectors_per_cluster as u32;
+
+        if cluster_count <= FAT12_MAX_CLUSTERS {
+            return Fat12Geometry {
+                sectors_per_cluster,
+                fat_sectors,
+                root_dir_sectors,
+            };
+        }
+    }
+
+    let sectors_per_cluster = 64;
+    let fat_sectors = calculate_fat_sectors(partition_blocks, sectors_per_cluster, root_dir_sectors);
+    Fat12Geometry {
+        sectors_per_cluster,
+        fat_sectors,
+        root_dir_sectors,
+    }
+}
+
+fn calculate_fat_sectors(partition_blocks: u32, sectors_per_cluster: u8, root_dir_sectors: u16) -> u16 {
+    let mut fat_sectors = 1u32;
+
+    loop {
+        let non_data = RESERVED_SECTORS as u32 + root_dir_sectors as u32 + FAT_COUNT as u32 * fat_sectors;
+        let data_sectors = partition_blocks.saturating_sub(non_data);
+        let cluster_count = data_sectors / sectors_per_cluster as u32;
+
+        // FAT12 uses 12-bit entries: required bytes = ceil(entries * 1.5).
+        let fat_entries = cluster_count + 2;
+        let required_fat_bytes = (fat_entries * 3).div_ceil(2);
+        let required_fat_sectors = required_fat_bytes.div_ceil(BLOCK_SIZE as u32);
+
+        if required_fat_sectors <= fat_sectors {
+            return fat_sectors as u16;
+        }
+
+        fat_sectors = required_fat_sectors;
+    }
 }

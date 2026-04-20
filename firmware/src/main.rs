@@ -2,9 +2,9 @@
 #![no_main]
 
 mod app;
-mod feram;
+mod drivers;
 mod init;
-mod spi;
+mod storage;
 mod usb;
 
 use panic_halt as _;

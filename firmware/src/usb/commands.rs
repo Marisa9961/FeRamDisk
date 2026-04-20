@@ -21,7 +21,7 @@ use crate::usb::scsi::{
     build_inquiry_response, build_mode_sense_10_response, build_mode_sense_6_response,
     build_read_capacity_10_response, build_read_format_capacities_response, mode_page_supported,
 };
-use crate::usb::storage::{BlockStorage, StorageError};
+use crate::storage::{BlockStorage, StorageError};
 use embassy_time::{with_timeout, Duration};
 use embassy_usb_driver::{EndpointError, EndpointIn, EndpointOut};
 

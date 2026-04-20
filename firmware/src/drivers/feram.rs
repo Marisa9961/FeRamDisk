@@ -2,7 +2,7 @@
 
 use core::cmp::min;
 
-use crate::spi::{FramSpi, FramSpiError};
+use crate::drivers::spi::{FramSpi, FramSpiError};
 use embedded_hal::digital::OutputPin;
 
 pub const BLOCK_SIZE: usize = 512;
@@ -42,7 +42,7 @@ const CMD_SLEEP: u8 = 0xB9;
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum FeRamError<SpiError, CsError> {
     OutOfRange,
-    Bus(crate::spi::FramSpiError<SpiError, CsError>),
+    Bus(crate::drivers::spi::FramSpiError<SpiError, CsError>),
 }
 
 pub struct FeRam<BUS> {

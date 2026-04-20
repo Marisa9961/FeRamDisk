@@ -2,9 +2,9 @@
 
 use core::cmp::min;
 
+use crate::storage::BlockStorage;
 use crate::usb::constants::{BOT_ACTION_STALL_IN, BOT_ACTION_STALL_OUT};
 use crate::usb::core as msc;
-use crate::usb::storage::BlockStorage;
 use embassy_futures::join::join;
 use embassy_futures::select::{select, Either};
 use embassy_time::Timer;

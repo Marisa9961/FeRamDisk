@@ -9,7 +9,7 @@ use crate::usb::constants::{
     CBW_READ_TIMEOUT_MS, CBW_SIGNATURE, CSW_SIGNATURE, CSW_STATUS_PHASE_ERROR,
     LUN_COUNT, USB_PACKET_SIZE,
 };
-use crate::usb::storage::BlockStorage;
+use crate::storage::BlockStorage;
 use embassy_time::{with_timeout, Duration};
 use embassy_usb_driver::{EndpointError, EndpointIn, EndpointOut};
 

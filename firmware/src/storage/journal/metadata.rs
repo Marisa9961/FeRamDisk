@@ -2,59 +2,15 @@
 
 use core::cmp::min;
 
-use crate::feram::{FeRam, FeRamError, BLOCK_SIZE, TOTAL_BLOCKS};
-use crate::spi::FramSpi;
-use embedded_hal::digital::OutputPin;
-
-/// Errors surfaced by the logical block backend and mapped to SCSI sense data.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum StorageError {
-    NotReady,
-    MediumError,
-    WriteProtect,
-    HardwareError,
-}
-
-pub const JOURNAL_RESERVED_BLOCKS: u32 = 2;
-
-const JOURNAL_STATE_CLEAN: u8 = 0x00;
-const JOURNAL_STATE_COMMITTED: u8 = 0xA5;
-const JOURNAL_MAGIC: [u8; 3] = *b"JNL";
-const JOURNAL_HEADER_STATE_OFFSET: usize = 0;
-const JOURNAL_HEADER_MAGIC_OFFSET: usize = 1;
-const JOURNAL_HEADER_TARGET_LBA_OFFSET: usize = 4;
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-struct LbaRange {
-    start: u32,
-    end_exclusive: u32,
-}
-
-impl LbaRange {
-    const fn empty() -> Self {
-        Self {
-            start: 0,
-            end_exclusive: 0,
-        }
-    }
-
-    fn contains(&self, lba: u32) -> bool {
-        lba >= self.start && lba < self.end_exclusive
-    }
-}
-
-pub const fn visible_block_count_from_physical(physical_blocks: u32) -> u32 {
-    physical_blocks.saturating_sub(JOURNAL_RESERVED_BLOCKS)
-}
-
-/// Byte-addressable physical backend used by the metadata journal layer.
-pub trait JournalBackend {
-    fn physical_block_count(&self) -> u32;
-    async fn read_physical_block(&mut self, block_index: u32, out: &mut [u8; BLOCK_SIZE]) -> Result<(), StorageError>;
-    async fn write_physical_block(&mut self, block_index: u32, data: &[u8; BLOCK_SIZE]) -> Result<(), StorageError>;
-    async fn read_bytes(&mut self, address: usize, out: &mut [u8]) -> Result<(), StorageError>;
-    async fn write_bytes(&mut self, address: usize, data: &[u8]) -> Result<(), StorageError>;
-}
+use crate::drivers::feram::BLOCK_SIZE;
+use crate::storage::backend::JournalBackend;
+use crate::storage::block::BlockStorage;
+use crate::storage::error::StorageError;
+use crate::storage::journal::layout::{
+    visible_block_count_from_physical, LbaRange, JOURNAL_HEADER_MAGIC_OFFSET,
+    JOURNAL_HEADER_STATE_OFFSET, JOURNAL_HEADER_TARGET_LBA_OFFSET, JOURNAL_MAGIC,
+    JOURNAL_RESERVED_BLOCKS, JOURNAL_STATE_CLEAN, JOURNAL_STATE_COMMITTED,
+};
 
 /// Metadata-only atomic journal wrapper.
 ///
@@ -236,8 +192,13 @@ where
         let fat_count = boot_sector[16] as u32;
         let root_dir_entries = u16::from_le_bytes([boot_sector[17], boot_sector[18]]) as u32;
         let fat_sectors_16 = u16::from_le_bytes([boot_sector[22], boot_sector[23]]) as u32;
-        let fat_sectors_32 = u32::from_le_bytes([boot_sector[36], boot_sector[37], boot_sector[38], boot_sector[39]]);
-        let fat_sectors = if fat_sectors_16 != 0 { fat_sectors_16 } else { fat_sectors_32 };
+        let fat_sectors_32 =
+            u32::from_le_bytes([boot_sector[36], boot_sector[37], boot_sector[38], boot_sector[39]]);
+        let fat_sectors = if fat_sectors_16 != 0 {
+            fat_sectors_16
+        } else {
+            fat_sectors_32
+        };
 
         if fat_count == 0 || fat_sectors == 0 {
             return Ok(LbaRange::empty());
@@ -270,68 +231,14 @@ where
             if partition_type != 0 && lba_size != 0 {
                 let clamped_size = min(
                     lba_size,
-                    self.logical_block_count.saturating_sub(min(lba_start, self.logical_block_count)),
+                    self.logical_block_count
+                        .saturating_sub(min(lba_start, self.logical_block_count)),
                 );
                 return (lba_start, clamped_size);
             }
         }
 
         (0, self.logical_block_count)
-    }
-}
-
-/// Logical block-device contract used by the MSC BOT command engine.
-pub trait BlockStorage {
-    fn block_count(&self) -> u32;
-
-    /// Report whether the logical unit is ready to accept media commands.
-    ///
-    /// IMPORTANT: real hardware backends should override this and return actual
-    /// readiness instead of relying on the default true.
-    ///
-    /// Backends that need async initialization should return false until the
-    /// medium is actually usable.
-    fn is_ready(&self) -> bool {
-        true
-    }
-
-    fn is_write_protected(&self) -> bool {
-        false
-    }
-
-    async fn read_block(&mut self, block_index: u32, out: &mut [u8; BLOCK_SIZE]) -> Result<(), StorageError>;
-    async fn write_block(&mut self, block_index: u32, data: &[u8; BLOCK_SIZE]) -> Result<(), StorageError>;
-}
-
-impl<'d, CS0, CS1, CS2, CS3> BlockStorage for FeRam<FramSpi<'d, CS0, CS1, CS2, CS3>>
-where
-    CS0: OutputPin,
-    CS1: OutputPin<Error = CS0::Error>,
-    CS2: OutputPin<Error = CS0::Error>,
-    CS3: OutputPin<Error = CS0::Error>,
-{
-    fn block_count(&self) -> u32 {
-        TOTAL_BLOCKS
-    }
-
-    fn is_ready(&self) -> bool {
-        true
-    }
-
-    fn is_write_protected(&self) -> bool {
-        false
-    }
-
-    async fn read_block(&mut self, block_index: u32, out: &mut [u8; BLOCK_SIZE]) -> Result<(), StorageError> {
-        self.read_block(block_index, out)
-            .await
-            .map_err(map_feram_error)
-    }
-
-    async fn write_block(&mut self, block_index: u32, data: &[u8; BLOCK_SIZE]) -> Result<(), StorageError> {
-        self.write_block(block_index, data)
-            .await
-            .map_err(map_feram_error)
     }
 }
 
@@ -381,44 +288,5 @@ where
                 .write_physical_block(self.logical_to_physical_lba(block_index), data)
                 .await
         }
-    }
-}
-
-impl<'d, CS0, CS1, CS2, CS3> JournalBackend for FeRam<FramSpi<'d, CS0, CS1, CS2, CS3>>
-where
-    CS0: OutputPin,
-    CS1: OutputPin<Error = CS0::Error>,
-    CS2: OutputPin<Error = CS0::Error>,
-    CS3: OutputPin<Error = CS0::Error>,
-{
-    fn physical_block_count(&self) -> u32 {
-        TOTAL_BLOCKS
-    }
-
-    async fn read_physical_block(&mut self, block_index: u32, out: &mut [u8; BLOCK_SIZE]) -> Result<(), StorageError> {
-        self.read_block(block_index, out)
-            .await
-            .map_err(map_feram_error)
-    }
-
-    async fn write_physical_block(&mut self, block_index: u32, data: &[u8; BLOCK_SIZE]) -> Result<(), StorageError> {
-        self.write_block(block_index, data)
-            .await
-            .map_err(map_feram_error)
-    }
-
-    async fn read_bytes(&mut self, address: usize, out: &mut [u8]) -> Result<(), StorageError> {
-        self.read(address, out).await.map_err(map_feram_error)
-    }
-
-    async fn write_bytes(&mut self, address: usize, data: &[u8]) -> Result<(), StorageError> {
-        self.write(address, data).await.map_err(map_feram_error)
-    }
-}
-
-fn map_feram_error<SpiError, CsError>(error: FeRamError<SpiError, CsError>) -> StorageError {
-    match error {
-        FeRamError::OutOfRange => StorageError::MediumError,
-        FeRamError::Bus(_) => StorageError::HardwareError,
     }
 }

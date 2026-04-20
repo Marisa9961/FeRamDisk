@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-pub use crate::feram::BLOCK_SIZE;
+pub use crate::drivers::feram::BLOCK_SIZE;
 
 pub(crate) const CBW_SIGNATURE: u32 = 0x4342_5355;
 pub(crate) const CSW_SIGNATURE: u32 = 0x5342_5355;

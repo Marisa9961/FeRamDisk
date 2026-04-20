@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::feram::BLOCK_SIZE;
+use crate::drivers::feram::BLOCK_SIZE;
 use crate::usb::constants::MODE_PAGE_CACHING;
 
 pub(crate) fn build_inquiry_response() -> [u8; 36] {

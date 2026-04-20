@@ -3,4 +3,3 @@ pub mod commands;
 pub mod constants;
 pub mod core;
 pub mod scsi;
-pub mod storage;

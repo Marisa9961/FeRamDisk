@@ -3,23 +3,39 @@ name = "feramdisk-firmware"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["hardware"]
+hardware = [
+	"dep:cortex-m",
+	"dep:cortex-m-rt",
+	"dep:embassy-executor",
+	"dep:embassy-stm32",
+	"dep:panic-halt",
+	"dep:rtt-target",
+]
+
 [[bin]]
 name = "feramdisk-firmware"
 path = "src/main.rs"
 test = false
 bench = false
+required-features = ["hardware"]
 
 [dependencies]
-cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
-cortex-m-rt = "0.7.5"
-embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "executor-interrupt"] }
 embassy-futures = "0.1.2"
-embassy-stm32 = { version = "0.6.0", features = ["stm32g431cb", "time-driver-any", "exti", "memory-x"] }
 embassy-usb-driver = "0.2.0"
 embassy-time = "0.5.1"
 embedded-hal = "1.0.0"
-panic-halt = "1.0.0"
-rtt-target = "0.6.2"
+cortex-m = { version = "0.7.7", features = ["critical-section-single-core"], optional = true }
+cortex-m-rt = { version = "0.7.5", optional = true }
+embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "executor-interrupt"], optional = true }
+embassy-stm32 = { version = "0.6.0", features = ["stm32g431cb", "time-driver-any", "exti", "memory-x"], optional = true }
+panic-halt = { version = "1.0.0", optional = true }
+rtt-target = { version = "0.6.2", optional = true }
+
+[dev-dependencies]
+embassy-time = { version = "0.5.1", features = ["mock-driver", "generic-queue-8"] }
+critical-section = { version = "1.2.0", features = ["std"] }
 
 [profile.dev]
 panic = "abort"

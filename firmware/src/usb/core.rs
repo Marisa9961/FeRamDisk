@@ -61,6 +61,57 @@ pub(crate) enum DataDirection {
     Out,
 }
 
+pub(crate) trait DataEndpoint {
+    async fn endpoint_read(&mut self, buf: &mut [u8]) -> Result<usize, EndpointError>;
+    async fn endpoint_write(&mut self, buf: &[u8]) -> Result<(), EndpointError>;
+}
+
+pub(crate) struct OutDataEndpoint<'a, T> {
+    inner: &'a mut T,
+}
+
+impl<'a, T> OutDataEndpoint<'a, T> {
+    pub(crate) fn new(inner: &'a mut T) -> Self {
+        Self { inner }
+    }
+}
+
+impl<T> DataEndpoint for OutDataEndpoint<'_, T>
+where
+    T: EndpointOut,
+{
+    async fn endpoint_read(&mut self, buf: &mut [u8]) -> Result<usize, EndpointError> {
+        self.inner.read(buf).await
+    }
+
+    async fn endpoint_write(&mut self, _buf: &[u8]) -> Result<(), EndpointError> {
+        Err(EndpointError::BufferOverflow)
+    }
+}
+
+pub(crate) struct InDataEndpoint<'a, T> {
+    inner: &'a mut T,
+}
+
+impl<'a, T> InDataEndpoint<'a, T> {
+    pub(crate) fn new(inner: &'a mut T) -> Self {
+        Self { inner }
+    }
+}
+
+impl<T> DataEndpoint for InDataEndpoint<'_, T>
+where
+    T: EndpointIn,
+{
+    async fn endpoint_read(&mut self, _buf: &mut [u8]) -> Result<usize, EndpointError> {
+        Err(EndpointError::BufferOverflow)
+    }
+
+    async fn endpoint_write(&mut self, buf: &[u8]) -> Result<(), EndpointError> {
+        self.inner.write(buf).await
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Cbw {
     pub(crate) packet_len: usize,
@@ -192,10 +243,13 @@ where
                     }
                 }
                 BotState::Executing(cbw) => {
+                    let mut out_data_ep = OutDataEndpoint::new(&mut out_ep);
+                    let mut in_data_ep = InDataEndpoint::new(&mut in_ep);
+
                     let outcome = match execute_command(
                         &mut storage,
-                        &mut out_ep,
-                        &mut in_ep,
+                        &mut out_data_ep,
+                        &mut in_data_ep,
                         &mut sense,
                         &mut prevent_medium_removal,
                         cbw,
@@ -280,20 +334,81 @@ pub(crate) async fn send_in_data<IN>(
     expects_in: bool,
 ) -> Result<u32, EndpointError>
 where
-    IN: EndpointIn,
+    IN: DataEndpoint,
 {
     let total_length = min(data.len(), expected_length as usize);
     let mut offset = 0usize;
 
     while offset < total_length {
         let end = min(offset + USB_PACKET_SIZE, total_length);
-        in_ep.write(&data[offset..end]).await?;
+        in_ep.endpoint_write(&data[offset..end]).await?;
         offset = end;
     }
 
     if expects_in && total_length > 0 && total_length < expected_length as usize && total_length % USB_PACKET_SIZE == 0 {
-        in_ep.write(&[]).await?;
+        in_ep.endpoint_write(&[]).await?;
     }
 
     Ok(total_length as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_cbw_packet(signature: u32, flags: u8, lun: u8, cmd_len: u8, transfer_len: u32) -> [u8; 31] {
+        let mut packet = [0u8; 31];
+        packet[0..4].copy_from_slice(&signature.to_le_bytes());
+        packet[4..8].copy_from_slice(&0xAABB_CCDD_u32.to_le_bytes());
+        packet[8..12].copy_from_slice(&transfer_len.to_le_bytes());
+        packet[12] = flags;
+        packet[13] = lun;
+        packet[14] = cmd_len;
+        packet[15] = 0x12;
+        packet
+    }
+
+    #[test]
+    fn cbw_parse_extracts_fields() {
+        let packet = build_cbw_packet(CBW_SIGNATURE, 0x80, 0, 10, 512);
+        let cbw = Cbw::parse(&packet);
+
+        assert_eq!(cbw.packet_len, 31);
+        assert!(cbw.signature_valid);
+        assert_eq!(cbw.tag, 0xAABB_CCDD);
+        assert_eq!(cbw.data_transfer_length, 512);
+        assert_eq!(cbw.flags, 0x80);
+        assert_eq!(cbw.command_length, 10);
+        assert_eq!(cbw.opcode(), 0x12);
+    }
+
+    #[test]
+    fn cbw_is_valid_checks_core_constraints() {
+        let valid = Cbw::parse(&build_cbw_packet(CBW_SIGNATURE, 0x80, 0, 10, 1));
+        assert!(valid.is_valid());
+
+        let invalid_signature = Cbw::parse(&build_cbw_packet(0xDEAD_BEEF, 0x80, 0, 10, 1));
+        assert!(!invalid_signature.is_valid());
+
+        let invalid_flags = Cbw::parse(&build_cbw_packet(CBW_SIGNATURE, 0x01, 0, 10, 1));
+        assert!(!invalid_flags.is_valid());
+
+        let invalid_lun = Cbw::parse(&build_cbw_packet(CBW_SIGNATURE, 0x80, LUN_COUNT, 10, 1));
+        assert!(!invalid_lun.is_valid());
+
+        let invalid_cmd_len = Cbw::parse(&build_cbw_packet(CBW_SIGNATURE, 0x80, 0, 0, 1));
+        assert!(!invalid_cmd_len.is_valid());
+    }
+
+    #[test]
+    fn cbw_data_direction_matches_flags_and_length() {
+        let none = Cbw::parse(&build_cbw_packet(CBW_SIGNATURE, 0x80, 0, 10, 0));
+        assert!(matches!(none.data_direction(), DataDirection::None));
+
+        let in_dir = Cbw::parse(&build_cbw_packet(CBW_SIGNATURE, 0x80, 0, 10, 64));
+        assert!(matches!(in_dir.data_direction(), DataDirection::In));
+
+        let out_dir = Cbw::parse(&build_cbw_packet(CBW_SIGNATURE, 0x00, 0, 10, 64));
+        assert!(matches!(out_dir.data_direction(), DataDirection::Out));
+    }
 }

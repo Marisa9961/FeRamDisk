@@ -16,14 +16,14 @@ use crate::usb::constants::{
     SCSI_WRITE_10, SENSE_DATA_PROTECT, SENSE_HARDWARE_ERROR, SENSE_ILLEGAL_REQUEST,
     SENSE_MEDIUM_ERROR, SENSE_NOT_READY, USB_PACKET_SIZE,
 };
-use crate::usb::core::{send_in_data, Cbw, Csw, DataDirection};
+use crate::usb::core::{send_in_data, Cbw, Csw, DataDirection, DataEndpoint};
 use crate::usb::scsi::{
     build_inquiry_response, build_mode_sense_10_response, build_mode_sense_6_response,
     build_read_capacity_10_response, build_read_format_capacities_response, mode_page_supported,
 };
 use crate::storage::{BlockStorage, StorageError};
 use embassy_time::{with_timeout, Duration};
-use embassy_usb_driver::{EndpointError, EndpointIn, EndpointOut};
+use embassy_usb_driver::EndpointError;
 
 /// Fixed-format request-sense working state for the current command stream.
 #[derive(Copy, Clone, Debug, Default)]
@@ -196,8 +196,8 @@ pub(crate) async fn execute_command<OUT, IN, S>(
     cbw: Cbw,
 ) -> Result<CommandOutcome, EndpointError>
 where
-    OUT: EndpointOut,
-    IN: EndpointIn,
+    OUT: DataEndpoint,
+    IN: DataEndpoint,
     S: BlockStorage,
 {
     let expected_length = cbw.data_transfer_length;
@@ -472,7 +472,7 @@ async fn read_blocks<IN, S>(
     expects_in: bool,
 ) -> Result<u32, TransferError>
 where
-    IN: EndpointIn,
+    IN: DataEndpoint,
     S: BlockStorage,
 {
     let total_payload = block_count as usize * BLOCK_SIZE;
@@ -500,7 +500,7 @@ where
         while chunk_offset < chunk_len {
             let end = min(chunk_offset + USB_PACKET_SIZE, chunk_len);
             in_ep
-                .write(&block_buffer[chunk_offset..end])
+                .endpoint_write(&block_buffer[chunk_offset..end])
                 .await
                 .map_err(TransferError::Endpoint)?;
             chunk_offset = end;
@@ -511,7 +511,7 @@ where
     }
 
     if expects_in && sent > 0 && sent < expected_length as usize && sent % USB_PACKET_SIZE == 0 {
-        in_ep.write(&[]).await.map_err(TransferError::Endpoint)?;
+        in_ep.endpoint_write(&[]).await.map_err(TransferError::Endpoint)?;
     }
 
     Ok(sent as u32)
@@ -525,7 +525,7 @@ async fn write_blocks<OUT, S>(
     expected_length: u32,
 ) -> Result<WriteTransfer, TransferError>
 where
-    OUT: EndpointOut,
+    OUT: DataEndpoint,
     S: BlockStorage,
 {
     if expected_length == 0 {
@@ -548,7 +548,12 @@ where
     let mut block_fill = 0usize;
 
     while consumed_bytes < expected_length {
-        let packet_len = match with_timeout(Duration::from_millis(DATA_OUT_TIMEOUT_MS), out_ep.read(&mut packet)).await {
+        let packet_len = match with_timeout(
+            Duration::from_millis(DATA_OUT_TIMEOUT_MS),
+            out_ep.endpoint_read(&mut packet),
+        )
+        .await
+        {
             Ok(Ok(length)) => length,
             Ok(Err(error)) => return Err(TransferError::Endpoint(error)),
             Err(_) => {
@@ -614,7 +619,7 @@ where
 
 async fn discard_overflow_packets<OUT>(out_ep: &mut OUT) -> Result<(), EndpointError>
 where
-    OUT: EndpointOut,
+    OUT: DataEndpoint,
 {
     let mut packet = [0u8; USB_PACKET_SIZE];
     let mut drained = 0usize;
@@ -624,7 +629,12 @@ where
             break;
         }
 
-        let packet_len = match with_timeout(Duration::from_millis(OVERFLOW_DRAIN_TIMEOUT_MS), out_ep.read(&mut packet)).await {
+        let packet_len = match with_timeout(
+            Duration::from_millis(OVERFLOW_DRAIN_TIMEOUT_MS),
+            out_ep.endpoint_read(&mut packet),
+        )
+        .await
+        {
             Ok(Ok(length)) => length,
             Ok(Err(error)) => return Err(error),
             Err(_) => break,
@@ -647,4 +657,61 @@ fn parse_read_write_10(command: &[u8; 16]) -> (u32, u16) {
     let lba = u32::from_be_bytes([command[2], command[3], command[4], command[5]]);
     let block_count = u16::from_be_bytes([command[7], command[8]]);
     (lba, block_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DummyStorage {
+        blocks: u32,
+    }
+
+    impl BlockStorage for DummyStorage {
+        fn block_count(&self) -> u32 {
+            self.blocks
+        }
+
+        async fn read_block(&mut self, _block_index: u32, _out: &mut [u8; BLOCK_SIZE]) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        async fn write_block(&mut self, _block_index: u32, _data: &[u8; BLOCK_SIZE]) -> Result<(), StorageError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sense_to_response_encodes_flags_and_fields() {
+        let sense = SenseData::transfer_length_mismatch(1234, 7);
+        let response = sense.to_response();
+
+        assert_eq!(response[0] & 0x80, 0x80);
+        assert_eq!(response[2] & 0x20, 0x20);
+        assert_eq!(u32::from_be_bytes([response[3], response[4], response[5], response[6]]), 1234);
+        assert_eq!(response[15], 0xC0);
+        assert_eq!(response[17], 0x07);
+    }
+
+    #[test]
+    fn parse_read_write_10_extracts_lba_and_block_count() {
+        let mut command = [0u8; 16];
+        command[2..6].copy_from_slice(&0x1122_3344_u32.to_be_bytes());
+        command[7..9].copy_from_slice(&0x00F0_u16.to_be_bytes());
+
+        let (lba, blocks) = super::parse_read_write_10(&command);
+        assert_eq!(lba, 0x1122_3344);
+        assert_eq!(blocks, 0x00F0);
+    }
+
+    #[test]
+    fn block_range_valid_checks_bounds_and_zero_length() {
+        let storage = DummyStorage { blocks: 128 };
+
+        assert!(super::block_range_valid(&storage, 10, 0));
+        assert!(super::block_range_valid(&storage, 0, 1));
+        assert!(super::block_range_valid(&storage, 127, 1));
+        assert!(!super::block_range_valid(&storage, 128, 1));
+        assert!(!super::block_range_valid(&storage, 120, 16));
+    }
 }

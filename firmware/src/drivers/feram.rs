@@ -5,7 +5,7 @@ use core::cmp::min;
 use crate::drivers::spi::{FramSpi, FramSpiError};
 use embedded_hal::digital::OutputPin;
 
-pub const BLOCK_SIZE: usize = 512;
+pub const BLOCK_SIZE: usize = crate::storage::BLOCK_SIZE;
 pub const CHIP_COUNT: usize = 4;
 pub const CHIP_SIZE_BYTES: usize = 32 * 1024;
 pub const TOTAL_SIZE_BYTES: usize = CHIP_COUNT * CHIP_SIZE_BYTES;

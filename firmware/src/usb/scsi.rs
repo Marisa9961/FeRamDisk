@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::drivers::feram::BLOCK_SIZE;
+use crate::storage::BLOCK_SIZE;
 use crate::usb::constants::MODE_PAGE_CACHING;
 
 pub(crate) fn build_inquiry_response() -> [u8; 36] {
@@ -87,4 +87,28 @@ pub(crate) fn build_mode_sense_10_response(write_protected: bool) -> [u8; 28] {
     response[8..].copy_from_slice(&caching_page);
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inquiry_response_has_expected_standard_fields() {
+        let response = build_inquiry_response();
+
+        assert_eq!(response.len(), 36);
+        assert_eq!(response[0], 0x00);
+        assert_eq!(response[1], 0x80);
+        assert_eq!(&response[8..16], b"FeRam   ");
+        assert_eq!(&response[16..32], b"FeRamDisk       ");
+    }
+
+    #[test]
+    fn read_capacity_10_response_encodes_last_lba_and_block_size() {
+        let response = build_read_capacity_10_response(1024);
+
+        assert_eq!(u32::from_be_bytes([response[0], response[1], response[2], response[3]]), 1023);
+        assert_eq!(u32::from_be_bytes([response[4], response[5], response[6], response[7]]), BLOCK_SIZE as u32);
+    }
 }

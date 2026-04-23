@@ -1,9 +1,15 @@
 #![allow(dead_code)]
+#![allow(async_fn_in_trait)]
 
-use crate::drivers::feram::{FeRam, BLOCK_SIZE, TOTAL_BLOCKS};
+use crate::storage::BLOCK_SIZE;
+#[cfg(feature = "hardware")]
+use crate::drivers::feram::{FeRam, TOTAL_BLOCKS};
+#[cfg(feature = "hardware")]
 use crate::drivers::spi::FramSpi;
+#[cfg(feature = "hardware")]
 use crate::storage::backend::map_feram_error;
 use crate::storage::error::StorageError;
+#[cfg(feature = "hardware")]
 use embedded_hal::digital::OutputPin;
 
 /// Logical block-device contract used by the MSC BOT command engine.
@@ -29,6 +35,7 @@ pub trait BlockStorage {
     async fn write_block(&mut self, block_index: u32, data: &[u8; BLOCK_SIZE]) -> Result<(), StorageError>;
 }
 
+#[cfg(feature = "hardware")]
 impl<'d, CS0, CS1, CS2, CS3> BlockStorage for FeRam<FramSpi<'d, CS0, CS1, CS2, CS3>>
 where
     CS0: OutputPin,

@@ -31,3 +31,16 @@ impl LbaRange {
 pub const fn visible_block_count_from_physical(physical_blocks: u32) -> u32 {
     physical_blocks.saturating_sub(JOURNAL_RESERVED_BLOCKS)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visible_block_count_reserves_journal_blocks() {
+        assert_eq!(visible_block_count_from_physical(0), 0);
+        assert_eq!(visible_block_count_from_physical(1), 0);
+        assert_eq!(visible_block_count_from_physical(2), 0);
+        assert_eq!(visible_block_count_from_physical(10), 8);
+    }
+}

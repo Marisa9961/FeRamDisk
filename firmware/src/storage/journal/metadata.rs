@@ -2,7 +2,7 @@
 
 use core::cmp::min;
 
-use crate::drivers::feram::BLOCK_SIZE;
+use crate::storage::BLOCK_SIZE;
 use crate::storage::backend::JournalBackend;
 use crate::storage::block::BlockStorage;
 use crate::storage::error::StorageError;
@@ -288,5 +288,78 @@ where
                 .write_physical_block(self.logical_to_physical_lba(block_index), data)
                 .await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DummyBackend {
+        physical_blocks: u32,
+    }
+
+    impl JournalBackend for DummyBackend {
+        fn physical_block_count(&self) -> u32 {
+            self.physical_blocks
+        }
+
+        async fn read_physical_block(&mut self, _block_index: u32, _out: &mut [u8; BLOCK_SIZE]) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        async fn write_physical_block(&mut self, _block_index: u32, _data: &[u8; BLOCK_SIZE]) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        async fn read_bytes(&mut self, _address: usize, _out: &mut [u8]) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        async fn write_bytes(&mut self, _address: usize, _data: &[u8]) -> Result<(), StorageError> {
+            Ok(())
+        }
+    }
+
+    fn build_mbr(partition_type: u8, lba_start: u32, lba_size: u32, valid_signature: bool) -> [u8; BLOCK_SIZE] {
+        let mut mbr = [0u8; BLOCK_SIZE];
+        let entry = &mut mbr[446..462];
+        entry[4] = partition_type;
+        entry[8..12].copy_from_slice(&lba_start.to_le_bytes());
+        entry[12..16].copy_from_slice(&lba_size.to_le_bytes());
+
+        if valid_signature {
+            mbr[510] = 0x55;
+            mbr[511] = 0xAA;
+        }
+
+        mbr
+    }
+
+    #[test]
+    fn parse_partition_geometry_returns_valid_partition() {
+        let storage = MetadataJournalStorage::new(DummyBackend { physical_blocks: 20 });
+        let mbr = build_mbr(0x01, 1, 10, true);
+
+        assert_eq!(storage.parse_partition_geometry(&mbr), (1, 10));
+    }
+
+    #[test]
+    fn parse_partition_geometry_falls_back_without_valid_entry() {
+        let storage = MetadataJournalStorage::new(DummyBackend { physical_blocks: 20 });
+        let invalid_signature = build_mbr(0x01, 1, 10, false);
+        let invalid_type = build_mbr(0x00, 1, 10, true);
+
+        assert_eq!(storage.parse_partition_geometry(&invalid_signature), (0, storage.logical_block_count));
+        assert_eq!(storage.parse_partition_geometry(&invalid_type), (0, storage.logical_block_count));
+    }
+
+    #[test]
+    fn parse_partition_geometry_clamps_partition_size_to_visible_capacity() {
+        let storage = MetadataJournalStorage::new(DummyBackend { physical_blocks: 10 });
+        let mbr = build_mbr(0x01, 3, 100, true);
+
+        // 10 physical blocks -> 8 logical blocks; from LBA 3 only 5 remain.
+        assert_eq!(storage.parse_partition_geometry(&mbr), (3, 5));
     }
 }

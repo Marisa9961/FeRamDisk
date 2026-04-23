@@ -1,8 +1,13 @@
 #![allow(dead_code)]
+#![allow(async_fn_in_trait)]
 
-use crate::drivers::feram::{FeRam, FeRamError, BLOCK_SIZE, TOTAL_BLOCKS};
+use crate::storage::BLOCK_SIZE;
+#[cfg(feature = "hardware")]
+use crate::drivers::feram::{FeRam, FeRamError, TOTAL_BLOCKS};
+#[cfg(feature = "hardware")]
 use crate::drivers::spi::FramSpi;
 use crate::storage::error::StorageError;
+#[cfg(feature = "hardware")]
 use embedded_hal::digital::OutputPin;
 
 /// Byte-addressable physical backend used by the metadata journal layer.
@@ -14,6 +19,7 @@ pub trait JournalBackend {
     async fn write_bytes(&mut self, address: usize, data: &[u8]) -> Result<(), StorageError>;
 }
 
+#[cfg(feature = "hardware")]
 impl<'d, CS0, CS1, CS2, CS3> JournalBackend for FeRam<FramSpi<'d, CS0, CS1, CS2, CS3>>
 where
     CS0: OutputPin,
@@ -46,6 +52,7 @@ where
     }
 }
 
+#[cfg(feature = "hardware")]
 pub(crate) fn map_feram_error<SpiError, CsError>(error: FeRamError<SpiError, CsError>) -> StorageError {
     match error {
         FeRamError::OutOfRange => StorageError::MediumError,

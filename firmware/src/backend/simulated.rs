@@ -148,6 +148,7 @@ impl From<InnerStallAfterCsw> for StallAfterCsw {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct CommandOutcome {
     pub csw: Csw,
+    pub stall_before_csw: StallAfterCsw,
     pub stall_after_csw: StallAfterCsw,
 }
 
@@ -193,6 +194,7 @@ where
 
     Ok(CommandOutcome {
         csw: outcome.csw.into(),
+        stall_before_csw: outcome.stall_before_csw.into(),
         stall_after_csw: outcome.stall_after_csw.into(),
     })
 }

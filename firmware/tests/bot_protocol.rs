@@ -136,6 +136,22 @@ fn bot_invalid_cbw_length_stalls_both_endpoints() {
 }
 
 #[test]
+// Verify oversized CBW packets are accepted and extra bytes are ignored.
+fn bot_oversized_cbw_is_accepted() {
+    let _guard = test_lock();
+
+    let harness = BotTestHarness::new(16);
+    let mut oversized = cbw_test_unit_ready(0xABCD_0001);
+    oversized.push(0xFF);
+    harness.queue_out_packet(oversized);
+
+    harness.run_for(40);
+
+    let csws = collect_csws(&harness);
+    assert!(csws.iter().any(|(tag, _, status)| *tag == 0xABCD_0001 && *status == CSW_STATUS_PASSED));
+}
+
+#[test]
 // Verify invalid LUN in CBW yields Phase Error CSW and dual-endpoint stall request.
 fn bot_invalid_lun_stalls_both_endpoints() {
     let _guard = test_lock();
@@ -199,4 +215,20 @@ fn bot_command_failure_requests_stall() {
 
     let actions = harness.take_bus_actions();
     assert_ne!(actions & BOT_ACTION_STALL_IN, 0);
+}
+
+#[test]
+// Verify write failures request a bulk-OUT stall after the CSW.
+fn bot_write_failure_requests_out_stall() {
+    let _guard = test_lock();
+
+    let harness = BotTestHarness::new(4);
+    harness.storage_inner().lock().unwrap().set_write_protected(true);
+    harness.queue_out_packet(cbw_write_10(0x5555_6666, 0, 1, 512));
+    harness.queue_out_packet(vec![0x00; 64]);
+
+    harness.run_for(60);
+
+    let actions = harness.take_bus_actions();
+    assert_ne!(actions & BOT_ACTION_STALL_OUT, 0);
 }

@@ -55,12 +55,27 @@ fn install_valid_fat12_layout(backend: &mut RamBackend, logical_blocks: u32) {
     );
 }
 
-fn write_journal_header(backend: &mut RamBackend, state: u8, target_lba: u32) {
+fn write_journal_header(backend: &mut RamBackend, state: u8, target_lba: u32, shadow_crc32: u32) {
     let mut header = [0u8; BLOCK_SIZE];
     header[0] = state;
     header[1..4].copy_from_slice(&JOURNAL_MAGIC);
     header[4..8].copy_from_slice(&target_lba.to_le_bytes());
+    header[8..12].copy_from_slice(&shadow_crc32.to_le_bytes());
+    let header_crc = crc32(&header[..12]);
+    header[12..16].copy_from_slice(&header_crc.to_le_bytes());
     backend.set_physical_block(0, header);
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for byte in data {
+        crc ^= *byte as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg() & 0xEDB8_8320;
+            crc = (crc >> 1) ^ mask;
+        }
+    }
+    !crc
 }
 
 fn op_index(ops: &[BackendOp], predicate: impl Fn(&BackendOp) -> bool) -> usize {
@@ -87,6 +102,33 @@ fn init_blank_media_creates_clean_header() {
 
     assert_eq!(header[0], JOURNAL_STATE_CLEAN);
     assert_eq!(&header[1..4], JOURNAL_MAGIC.as_slice());
+}
+
+#[test]
+// Verify unknown journal state is normalized to clean during initialize.
+fn recovery_with_unknown_journal_state_initializes_clean() {
+    let _guard = test_lock();
+
+    let backend = SharedRamBackend::new(32);
+    {
+        let state = backend.inner();
+        let mut state = state.lock().expect("backend poisoned");
+        let logical_blocks = 32 - JOURNAL_RESERVED_BLOCKS;
+        install_valid_fat12_layout(&mut state, logical_blocks);
+        let mut header = [0u8; BLOCK_SIZE];
+        header[0] = 0x42;
+        header[1..4].copy_from_slice(&JOURNAL_MAGIC);
+        state.set_physical_block(0, header);
+    }
+
+    let mut storage = MetadataJournalStorage::new(backend.clone());
+    run_async(async { storage.initialize().await.expect("init should succeed") });
+
+    let state = backend.inner();
+    let state = state.lock().unwrap();
+    let header = state.bytes_at(0, 16);
+    assert_eq!(header[0], JOURNAL_STATE_CLEAN);
+    assert_eq!(u32::from_le_bytes([header[12], header[13], header[14], header[15]]), crc32(&header[..12]));
 }
 
 #[test]
@@ -134,30 +176,30 @@ fn fat12_layout_detection_marks_protected_region() {
     let ops = ops.lock().expect("backend poisoned");
 
     let writes = ops.operations();
-    let idx_clean_1 = op_index(writes, |op| matches!(op, BackendOp::WriteBytes { address: 0, data } if data == &[JOURNAL_STATE_CLEAN]));
-    let idx_target = op_index(writes, |op| matches!(op, BackendOp::WriteBytes { address: 4, data } if data.len() == 4));
+    let idx_clean_header = op_index(writes, |op| matches!(op, BackendOp::WriteBytes { address: 0, data } if data.first() == Some(&JOURNAL_STATE_CLEAN)));
+    let idx_clean_header_crc = op_index(writes, |op| matches!(op, BackendOp::WriteBytes { address: 12, data } if data.len() == 4));
     let idx_shadow = op_index(writes, |op| matches!(op, BackendOp::WritePhysicalBlock { block_index: 1, .. }));
-    let idx_commit = op_index(writes, |op| matches!(op, BackendOp::WriteBytes { address: 0, data } if data == &[JOURNAL_STATE_COMMITTED]));
+    let idx_commit_header = op_index(writes, |op| matches!(op, BackendOp::WriteBytes { address: 0, data } if data.first() == Some(&JOURNAL_STATE_COMMITTED)));
     let idx_target_write = op_index(
         writes,
         |op| matches!(op, BackendOp::WritePhysicalBlock { block_index, .. } if *block_index == logical_to_physical(2)),
     );
-    let idx_clean_2 = writes
+    let idx_final_clean_header = writes
         .iter()
         .enumerate()
-        .rfind(|(_, op)| matches!(op, BackendOp::WriteBytes { address: 0, data } if data == &[JOURNAL_STATE_CLEAN]))
+        .rfind(|(_, op)| matches!(op, BackendOp::WriteBytes { address: 0, data } if data.first() == Some(&JOURNAL_STATE_CLEAN)))
         .map(|(idx, _)| idx)
         .expect("final clean state write not found");
 
-    assert!(idx_clean_1 < idx_target);
-    assert!(idx_target < idx_shadow);
-    assert!(idx_shadow < idx_commit);
-    assert!(idx_commit < idx_target_write);
-    assert!(idx_target_write < idx_clean_2);
+    assert!(idx_clean_header < idx_clean_header_crc);
+    assert!(idx_clean_header_crc < idx_shadow);
+    assert!(idx_shadow < idx_commit_header);
+    assert!(idx_commit_header < idx_target_write);
+    assert!(idx_target_write < idx_final_clean_header);
 }
 
 #[test]
-// Verify writes bypass journal when no valid partition metadata region is detected.
+// Verify unknown volume layout bypasses journaling and leaves metadata writes untouched.
 fn no_valid_partition_leaves_protected_region_empty() {
     let _guard = test_lock();
 
@@ -175,19 +217,15 @@ fn no_valid_partition_leaves_protected_region_empty() {
         storage
             .write_block(2, &block)
             .await
-            .expect("passthrough write failed")
+                .expect("passthrough write failed")
     });
 
     let state = backend.inner();
     let state = state.lock().expect("backend poisoned");
     let ops = state.operations();
 
-    assert!(ops
-        .iter()
-        .any(|op| matches!(op, BackendOp::WritePhysicalBlock { block_index, .. } if *block_index == logical_to_physical(2))));
-    assert!(!ops
-        .iter()
-        .any(|op| matches!(op, BackendOp::WriteBytes { address: 0, .. })));
+    assert!(ops.iter().any(|op| matches!(op, BackendOp::WritePhysicalBlock { block_index, .. } if *block_index == logical_to_physical(2))));
+    assert!(!ops.iter().any(|op| matches!(op, BackendOp::WriteBytes { address: 0, .. })));
 }
 
 #[test]
@@ -271,10 +309,10 @@ fn recovery_replays_shadow_after_committed_before_target_write() {
         let mut state = state.lock().expect("backend poisoned");
         let logical_blocks = 32 - JOURNAL_RESERVED_BLOCKS;
         install_valid_fat12_layout(&mut state, logical_blocks);
-        write_journal_header(&mut state, JOURNAL_STATE_COMMITTED, 2);
-
         let mut shadow = [0xA7u8; BLOCK_SIZE];
         shadow[0] = 0x5C;
+        write_journal_header(&mut state, JOURNAL_STATE_COMMITTED, 2, crc32(&shadow));
+
         state.set_physical_block(1, shadow);
 
         let mut target = [0x00u8; BLOCK_SIZE];
@@ -302,9 +340,9 @@ fn recovery_clears_state_after_target_already_written() {
         let mut state = state.lock().expect("backend poisoned");
         let logical_blocks = 32 - JOURNAL_RESERVED_BLOCKS;
         install_valid_fat12_layout(&mut state, logical_blocks);
-        write_journal_header(&mut state, JOURNAL_STATE_COMMITTED, 2);
-
         let shadow = [0x7Bu8; BLOCK_SIZE];
+        write_journal_header(&mut state, JOURNAL_STATE_COMMITTED, 2, crc32(&shadow));
+
         state.set_physical_block(1, shadow);
         state.set_physical_block(logical_to_physical(2), shadow);
     }
@@ -329,7 +367,7 @@ fn recovery_ignores_out_of_capacity_target_lba() {
         let mut state = state.lock().expect("backend poisoned");
         let logical_blocks = 12 - JOURNAL_RESERVED_BLOCKS;
         install_valid_fat12_layout(&mut state, logical_blocks);
-        write_journal_header(&mut state, JOURNAL_STATE_COMMITTED, 99);
+        write_journal_header(&mut state, JOURNAL_STATE_COMMITTED, 99, 0);
 
         let shadow = [0xC3u8; BLOCK_SIZE];
         state.set_physical_block(1, shadow);
@@ -354,7 +392,7 @@ fn recovery_propagates_shadow_read_error() {
         let mut state = state.lock().expect("backend poisoned");
         let logical_blocks = 20 - JOURNAL_RESERVED_BLOCKS;
         install_valid_fat12_layout(&mut state, logical_blocks);
-        write_journal_header(&mut state, JOURNAL_STATE_COMMITTED, 2);
+        write_journal_header(&mut state, JOURNAL_STATE_COMMITTED, 2, 0);
         state.inject_read_block_error_at(1, StorageError::HardwareError);
     }
 
@@ -374,13 +412,109 @@ fn recovery_propagates_target_write_error() {
         let mut state = state.lock().expect("backend poisoned");
         let logical_blocks = 20 - JOURNAL_RESERVED_BLOCKS;
         install_valid_fat12_layout(&mut state, logical_blocks);
-        write_journal_header(&mut state, JOURNAL_STATE_COMMITTED, 2);
+        let shadow = [0u8; BLOCK_SIZE];
+        write_journal_header(&mut state, JOURNAL_STATE_COMMITTED, 2, crc32(&shadow));
         state.inject_write_block_error_at(logical_to_physical(2), StorageError::MediumError);
     }
 
     let mut storage = MetadataJournalStorage::new(backend);
     let err = run_async(async { storage.initialize().await.expect_err("expected MediumError") });
     assert_eq!(err, StorageError::MediumError);
+}
+
+#[test]
+// Verify CRC mismatch in committed shadow block is discarded and initialization continues.
+fn recovery_rejects_corrupted_shadow_crc() {
+    let _guard = test_lock();
+
+    let backend = SharedRamBackend::new(24);
+    {
+        let state = backend.inner();
+        let mut state = state.lock().expect("backend poisoned");
+        let logical_blocks = 24 - JOURNAL_RESERVED_BLOCKS;
+        install_valid_fat12_layout(&mut state, logical_blocks);
+
+        let shadow = [0x42u8; BLOCK_SIZE];
+        write_journal_header(&mut state, JOURNAL_STATE_COMMITTED, 2, 0xDEAD_BEEF);
+        state.set_physical_block(1, shadow);
+        state.set_physical_block(logical_to_physical(2), [0x11u8; BLOCK_SIZE]);
+    }
+
+    let mut storage = MetadataJournalStorage::new(backend.clone());
+    run_async(async { storage.initialize().await.expect("initialize should continue") });
+
+    let state = backend.inner();
+    let state = state.lock().expect("backend poisoned");
+    assert_eq!(state.bytes_at(0, 1)[0], JOURNAL_STATE_CLEAN);
+    assert_eq!(state.physical_block(logical_to_physical(2)), [0x11u8; BLOCK_SIZE]);
+}
+
+#[test]
+// Verify journal header CRC mismatch resets journal to clean defaults.
+fn recovery_rewrites_header_on_header_crc_mismatch() {
+    let _guard = test_lock();
+
+    let backend = SharedRamBackend::new(24);
+    {
+        let state = backend.inner();
+        let mut state = state.lock().expect("backend poisoned");
+        let logical_blocks = 24 - JOURNAL_RESERVED_BLOCKS;
+        install_valid_fat12_layout(&mut state, logical_blocks);
+
+        let mut header = [0u8; BLOCK_SIZE];
+        header[0] = JOURNAL_STATE_COMMITTED;
+        header[1..4].copy_from_slice(&JOURNAL_MAGIC);
+        header[4..8].copy_from_slice(&2u32.to_le_bytes());
+        header[8..12].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        header[12..16].copy_from_slice(&0x0000_0000u32.to_le_bytes());
+        state.set_physical_block(0, header);
+    }
+
+    let mut storage = MetadataJournalStorage::new(backend.clone());
+    run_async(async { storage.initialize().await.expect("initialize should continue") });
+
+    let state = backend.inner();
+    let state = state.lock().expect("backend poisoned");
+    let header = state.physical_block(0);
+    assert_eq!(header[0], JOURNAL_STATE_CLEAN);
+    assert_eq!(&header[1..4], JOURNAL_MAGIC.as_slice());
+    assert_eq!(u32::from_le_bytes([header[12], header[13], header[14], header[15]]), crc32(&header[..12]));
+}
+#[test]
+// Verify shadow block write failures during journaled writes are propagated.
+fn journal_write_propagates_shadow_write_error() {
+    let _guard = test_lock();
+
+    let backend = SharedRamBackend::new(32);
+    {
+        let state = backend.inner();
+        let mut state = state.lock().expect("backend poisoned");
+        let logical_blocks = 32 - JOURNAL_RESERVED_BLOCKS;
+        install_valid_fat12_layout(&mut state, logical_blocks);
+        state.inject_write_block_error_at(1, StorageError::HardwareError);
+    }
+
+    let mut storage = MetadataJournalStorage::new(backend.clone());
+    run_async(async { storage.initialize().await.expect("init should be ok") });
+
+    let result = run_async(async { storage.write_block(2, &[0xCC; BLOCK_SIZE]).await });
+    assert_eq!(result, Err(StorageError::HardwareError));
+}
+
+#[test]
+// Verify repeated initialize calls remain safe and keep the journal clean.
+fn double_initialize_should_be_idempotent() {
+    let _guard = test_lock();
+
+    let backend = SharedRamBackend::new(32);
+    let mut storage = MetadataJournalStorage::new(backend.clone());
+
+    run_async(async { storage.initialize().await.expect("first init") });
+    run_async(async { storage.initialize().await.expect("second init") });
+
+    let state = backend.inner();
+    let state = state.lock().unwrap();
+    assert_eq!(state.bytes_at(0, 1)[0], JOURNAL_STATE_CLEAN);
 }
 
 #[test]

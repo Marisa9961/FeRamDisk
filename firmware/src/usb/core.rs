@@ -5,17 +5,19 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::usb::commands::{execute_command, SenseData, StallAfterCsw};
 use crate::usb::constants::{
+    BOT_STALL_ACK_TIMEOUT_MS,
     BOT_ACTION_STALL_IN, BOT_ACTION_STALL_OUT, BOT_EVENT_BULK_RESET,
     CBW_READ_TIMEOUT_MS, CBW_SIGNATURE, CSW_SIGNATURE, CSW_STATUS_PHASE_ERROR,
     LUN_COUNT, USB_PACKET_SIZE,
 };
 use crate::storage::BlockStorage;
-use embassy_time::{with_timeout, Duration};
+use embassy_time::{with_timeout, Duration, Instant, Timer};
 use embassy_usb_driver::{EndpointError, EndpointIn, EndpointOut};
 
 /// Bulk-Only Transport control structure shared between MSC data path and control path.
 pub struct BotControl {
     bus_actions: AtomicU8,
+    bus_actions_applied: AtomicU8,
     msc_events: AtomicU8,
 }
 
@@ -24,6 +26,7 @@ impl BotControl {
     pub const fn new() -> Self {
         Self {
             bus_actions: AtomicU8::new(0),
+            bus_actions_applied: AtomicU8::new(0),
             msc_events: AtomicU8::new(0),
         }
     }
@@ -46,6 +49,16 @@ impl BotControl {
     /// Consume and clear pending endpoint actions for the control task.
     pub fn take_bus_actions(&self) -> u8 {
         self.bus_actions.swap(0, Ordering::Acquire)
+    }
+
+    /// Acknowledge that requested endpoint actions were applied by the control task.
+    pub fn acknowledge_bus_actions(&self, applied: u8) {
+        self.bus_actions_applied.fetch_or(applied, Ordering::Release);
+    }
+
+    /// Consume and clear action-ack bits from the control task.
+    pub fn take_bus_action_acks(&self) -> u8 {
+        self.bus_actions_applied.swap(0, Ordering::Acquire)
     }
 
     /// Consume and clear pending BOT events for the MSC task.
@@ -146,7 +159,7 @@ impl Cbw {
     }
 
     pub(crate) fn is_valid(&self) -> bool {
-        self.packet_len == 31
+        self.packet_len >= 31
             && self.signature_valid
             && (self.flags & 0x7F) == 0
             && (self.lun & 0xF0) == 0
@@ -195,7 +208,11 @@ impl Csw {
 enum BotState {
     WaitingForCbw,
     Executing(Cbw),
-    SendingCsw { csw: Csw, stall_after_csw: StallAfterCsw },
+    SendingCsw {
+        csw: Csw,
+        stall_before_csw: StallAfterCsw,
+        stall_after_csw: StallAfterCsw,
+    },
 }
 
 pub async fn run<OUT, IN, S>(mut out_ep: OUT, mut in_ep: IN, mut storage: S, bot_control: &BotControl)
@@ -236,6 +253,7 @@ where
                                 residue: cbw.data_transfer_length,
                                 status: CSW_STATUS_PHASE_ERROR,
                             },
+                            stall_before_csw: StallAfterCsw::None,
                             stall_after_csw: StallAfterCsw::Both,
                         };
                     } else {
@@ -263,10 +281,20 @@ where
 
                     state = BotState::SendingCsw {
                         csw: outcome.csw,
+                        stall_before_csw: outcome.stall_before_csw,
                         stall_after_csw: outcome.stall_after_csw,
                     };
                 }
-                BotState::SendingCsw { csw, stall_after_csw } => {
+                BotState::SendingCsw {
+                    csw,
+                    stall_before_csw,
+                    stall_after_csw,
+                } => {
+                    request_stall_after_csw(bot_control, stall_before_csw);
+                    if !matches!(stall_before_csw, StallAfterCsw::None) {
+                        wait_for_stall_ack(bot_control, stall_before_csw).await;
+                    }
+
                     if send_csw(&mut in_ep, csw).await.is_err() {
                         break 'session;
                     }
@@ -288,6 +316,33 @@ fn request_stall_after_csw(bot_control: &BotControl, stall_after_csw: StallAfter
             bot_control.request_stall_in();
             bot_control.request_stall_out();
         }
+    }
+}
+
+fn stall_mask(stall: StallAfterCsw) -> u8 {
+    match stall {
+        StallAfterCsw::None => 0,
+        StallAfterCsw::In => BOT_ACTION_STALL_IN,
+        StallAfterCsw::Out => BOT_ACTION_STALL_OUT,
+        StallAfterCsw::Both => BOT_ACTION_STALL_IN | BOT_ACTION_STALL_OUT,
+    }
+}
+
+async fn wait_for_stall_ack(bot_control: &BotControl, stall: StallAfterCsw) {
+    let expected_mask = stall_mask(stall);
+    if expected_mask == 0 {
+        return;
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(BOT_STALL_ACK_TIMEOUT_MS);
+    let mut seen = 0u8;
+
+    while Instant::now() < deadline {
+        seen |= bot_control.take_bus_action_acks() & expected_mask;
+        if seen == expected_mask {
+            return;
+        }
+        Timer::after_millis(1).await;
     }
 }
 
@@ -410,5 +465,21 @@ mod tests {
 
         let out_dir = Cbw::parse(&build_cbw_packet(CBW_SIGNATURE, 0x00, 0, 10, 64));
         assert!(matches!(out_dir.data_direction(), DataDirection::Out));
+    }
+
+    #[test]
+    fn bot_control_acknowledges_and_consumes_stall_bits() {
+        let control = BotControl::new();
+
+        control.request_stall_in();
+        control.request_stall_out();
+        let requested = control.take_bus_actions();
+        assert_eq!(requested & (BOT_ACTION_STALL_IN | BOT_ACTION_STALL_OUT), BOT_ACTION_STALL_IN | BOT_ACTION_STALL_OUT);
+
+        control.acknowledge_bus_actions(requested);
+        let applied = control.take_bus_action_acks();
+        assert_eq!(applied & (BOT_ACTION_STALL_IN | BOT_ACTION_STALL_OUT), BOT_ACTION_STALL_IN | BOT_ACTION_STALL_OUT);
+
+        assert_eq!(control.take_bus_action_acks(), 0);
     }
 }

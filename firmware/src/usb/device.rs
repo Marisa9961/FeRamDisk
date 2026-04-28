@@ -138,13 +138,20 @@ fn apply_pending_bot_actions<B>(
     B: driver::Bus,
 {
     let actions = bot_control.take_bus_actions();
+    let mut applied = 0u8;
 
     if actions & BOT_ACTION_STALL_OUT != 0 {
         bus.endpoint_set_stalled(bulk_out_addr, true);
+        applied |= BOT_ACTION_STALL_OUT;
     }
 
     if actions & BOT_ACTION_STALL_IN != 0 {
         bus.endpoint_set_stalled(bulk_in_addr, true);
+        applied |= BOT_ACTION_STALL_IN;
+    }
+
+    if applied != 0 {
+        bot_control.acknowledge_bus_actions(applied);
     }
 }
 
@@ -160,21 +167,27 @@ fn reset_bulk_endpoints<B>(
 
     // BOT Reset requires clearing endpoint halt and re-synchronizing data toggle.
     // The generic embassy-usb-driver Bus trait has no explicit "reset toggle"
-    // primitive, so we perform the most portable sequence: clear STALL +
-    // disable/enable endpoints.
+    // primitive, so we perform a best-effort portable sequence: clear STALL +
+    // disable/enable endpoints, then repeat once to reduce backend-specific
+    // chances of stale PID/toggle state after class reset.
     //
     // Risk: if a backend does not reset data PID on this sequence internally,
     // host/device may still see PID mismatch until the next bus reset.
+    for _ in 0..2 {
+        bus.endpoint_set_stalled(bulk_out_addr, false);
+        bus.endpoint_set_stalled(bulk_in_addr, false);
+
+        bus.endpoint_set_enabled(bulk_out_addr, false);
+        bus.endpoint_set_enabled(bulk_in_addr, false);
+
+        if enabled {
+            bus.endpoint_set_enabled(bulk_out_addr, true);
+            bus.endpoint_set_enabled(bulk_in_addr, true);
+        }
+    }
+
     bus.endpoint_set_stalled(bulk_out_addr, false);
     bus.endpoint_set_stalled(bulk_in_addr, false);
-
-    bus.endpoint_set_enabled(bulk_out_addr, false);
-    bus.endpoint_set_enabled(bulk_in_addr, false);
-
-    if enabled {
-        bus.endpoint_set_enabled(bulk_out_addr, true);
-        bus.endpoint_set_enabled(bulk_in_addr, true);
-    }
 }
 
 async fn handle_setup<B, C>(

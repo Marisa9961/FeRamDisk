@@ -171,6 +171,7 @@ pub(crate) enum StallAfterCsw {
 
 pub(crate) struct CommandOutcome {
     pub(crate) csw: Csw,
+    pub(crate) stall_before_csw: StallAfterCsw,
     pub(crate) stall_after_csw: StallAfterCsw,
 }
 
@@ -205,7 +206,8 @@ where
 
     let mut transferred = 0u32;
     let mut status = CSW_STATUS_PASSED;
-    let mut stall_after_csw = StallAfterCsw::None;
+    let mut stall_before_csw = StallAfterCsw::None;
+    let stall_after_csw = StallAfterCsw::None;
 
     match opcode {
         SCSI_TEST_UNIT_READY => {
@@ -354,7 +356,7 @@ where
                         Err(TransferError::Storage(error)) => {
                             *sense = SenseData::from_storage_error(error, false);
                             status = CSW_STATUS_FAILED;
-                            stall_after_csw = StallAfterCsw::In;
+                            stall_before_csw = StallAfterCsw::In;
                         }
                     }
                 }
@@ -400,6 +402,7 @@ where
                         Err(TransferError::Storage(error)) => {
                             *sense = SenseData::from_storage_error(error, true);
                             status = CSW_STATUS_FAILED;
+                            stall_before_csw = StallAfterCsw::Out;
                         }
                     }
                 }
@@ -411,8 +414,12 @@ where
         }
     }
 
-    if status == CSW_STATUS_FAILED && expected_length > 0 && matches!(stall_after_csw, StallAfterCsw::None) {
-        stall_after_csw = match cbw.data_direction() {
+    if status == CSW_STATUS_FAILED
+        && expected_length > 0
+        && matches!(stall_before_csw, StallAfterCsw::None)
+        && matches!(stall_after_csw, StallAfterCsw::None)
+    {
+        stall_before_csw = match cbw.data_direction() {
             DataDirection::None => StallAfterCsw::None,
             DataDirection::In => StallAfterCsw::In,
             DataDirection::Out => StallAfterCsw::Out,
@@ -426,6 +433,7 @@ where
             residue,
             status,
         },
+        stall_before_csw,
         stall_after_csw,
     })
 }
@@ -437,6 +445,7 @@ fn phase_error(cbw: Cbw) -> CommandOutcome {
             residue: cbw.data_transfer_length,
             status: CSW_STATUS_PHASE_ERROR,
         },
+        stall_before_csw: StallAfterCsw::None,
         stall_after_csw: StallAfterCsw::Both,
     }
 }

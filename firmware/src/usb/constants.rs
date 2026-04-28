@@ -55,3 +55,4 @@ pub(crate) const USB_PACKET_SIZE: usize = 64;
 pub(crate) const BOT_ACTION_STALL_IN: u8 = 1 << 0;
 pub(crate) const BOT_ACTION_STALL_OUT: u8 = 1 << 1;
 pub(crate) const BOT_EVENT_BULK_RESET: u8 = 1 << 0;
+pub(crate) const BOT_STALL_ACK_TIMEOUT_MS: u64 = 10;

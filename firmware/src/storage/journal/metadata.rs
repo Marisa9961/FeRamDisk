@@ -8,9 +8,13 @@ use crate::storage::block::BlockStorage;
 use crate::storage::error::StorageError;
 use crate::storage::journal::layout::{
     visible_block_count_from_physical, LbaRange, JOURNAL_HEADER_MAGIC_OFFSET,
+    JOURNAL_HEADER_HEADER_CRC32_OFFSET,
+    JOURNAL_HEADER_SHADOW_CRC32_OFFSET,
     JOURNAL_HEADER_STATE_OFFSET, JOURNAL_HEADER_TARGET_LBA_OFFSET, JOURNAL_MAGIC,
     JOURNAL_RESERVED_BLOCKS, JOURNAL_STATE_CLEAN, JOURNAL_STATE_COMMITTED,
 };
+
+const JOURNAL_HEADER_DATA_LEN: usize = 12;
 
 /// Metadata-only atomic journal wrapper.
 ///
@@ -52,6 +56,7 @@ where
         }
 
         self.initialize_journal_header().await?;
+        self.normalize_journal_state().await?;
         self.protected_lbas = self.detect_protected_lba_range().await?;
         self.recover_pending_metadata_write().await?;
         self.ready = true;
@@ -81,10 +86,7 @@ where
             .await?;
 
         if magic != JOURNAL_MAGIC {
-            self.write_journal_state(JOURNAL_STATE_CLEAN).await?;
-            self.backend
-                .write_bytes(self.journal_header_address(JOURNAL_HEADER_MAGIC_OFFSET), &JOURNAL_MAGIC)
-                .await?;
+            self.write_header_fields(JOURNAL_STATE_CLEAN, 0, 0).await?;
         }
 
         Ok(())
@@ -98,10 +100,21 @@ where
         Ok(state[0])
     }
 
+    async fn normalize_journal_state(&mut self) -> Result<(), StorageError> {
+        if !self.validate_header_crc().await? {
+            self.write_header_fields(JOURNAL_STATE_CLEAN, 0, 0).await?;
+            return Ok(());
+        }
+
+        match self.read_journal_state().await? {
+            JOURNAL_STATE_CLEAN | JOURNAL_STATE_COMMITTED => Ok(()),
+            _ => self.write_journal_state(JOURNAL_STATE_CLEAN).await,
+        }
+    }
+
     async fn write_journal_state(&mut self, state: u8) -> Result<(), StorageError> {
-        self.backend
-            .write_bytes(self.journal_header_address(JOURNAL_HEADER_STATE_OFFSET), &[state])
-            .await
+        let (_, target_lba, shadow_crc) = self.read_header_fields().await?;
+        self.write_header_fields(state, target_lba, shadow_crc).await
     }
 
     async fn read_journal_target_lba(&mut self) -> Result<u32, StorageError> {
@@ -116,12 +129,114 @@ where
     }
 
     async fn write_journal_target_lba(&mut self, lba: u32) -> Result<(), StorageError> {
+        let (state, _, shadow_crc) = self.read_header_fields().await?;
+        self.write_header_fields(state, lba, shadow_crc).await
+    }
+
+    async fn read_journal_shadow_crc32(&mut self) -> Result<u32, StorageError> {
+        let mut crc = [0u8; 4];
+        self.backend
+            .read_bytes(
+                self.journal_header_address(JOURNAL_HEADER_SHADOW_CRC32_OFFSET),
+                &mut crc,
+            )
+            .await?;
+        Ok(u32::from_le_bytes(crc))
+    }
+
+    async fn write_journal_shadow_crc32(&mut self, crc32: u32) -> Result<(), StorageError> {
+        let (state, target_lba, _) = self.read_header_fields().await?;
+        self.write_header_fields(state, target_lba, crc32).await
+    }
+
+    async fn read_journal_header_crc32(&mut self) -> Result<u32, StorageError> {
+        let mut crc = [0u8; 4];
+        self.backend
+            .read_bytes(
+                self.journal_header_address(JOURNAL_HEADER_HEADER_CRC32_OFFSET),
+                &mut crc,
+            )
+            .await?;
+        Ok(u32::from_le_bytes(crc))
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for byte in data {
+            crc ^= *byte as u32;
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg() & 0xEDB8_8320;
+                crc = (crc >> 1) ^ mask;
+            }
+        }
+        !crc
+    }
+
+    fn encode_header(state: u8, target_lba: u32, shadow_crc: u32) -> [u8; JOURNAL_HEADER_DATA_LEN] {
+        let mut header = [0u8; JOURNAL_HEADER_DATA_LEN];
+        header[JOURNAL_HEADER_STATE_OFFSET] = state;
+        header[JOURNAL_HEADER_MAGIC_OFFSET..JOURNAL_HEADER_MAGIC_OFFSET + 3]
+            .copy_from_slice(&JOURNAL_MAGIC);
+        header[JOURNAL_HEADER_TARGET_LBA_OFFSET..JOURNAL_HEADER_TARGET_LBA_OFFSET + 4]
+            .copy_from_slice(&target_lba.to_le_bytes());
+        header[JOURNAL_HEADER_SHADOW_CRC32_OFFSET..JOURNAL_HEADER_SHADOW_CRC32_OFFSET + 4]
+            .copy_from_slice(&shadow_crc.to_le_bytes());
+        header
+    }
+
+    async fn read_header_fields(&mut self) -> Result<(u8, u32, u32), StorageError> {
+        let mut header = [0u8; JOURNAL_HEADER_DATA_LEN];
+        self.backend
+            .read_bytes(self.journal_header_address(0), &mut header)
+            .await?;
+
+        let state = header[JOURNAL_HEADER_STATE_OFFSET];
+        let target_lba = u32::from_le_bytes([
+            header[JOURNAL_HEADER_TARGET_LBA_OFFSET],
+            header[JOURNAL_HEADER_TARGET_LBA_OFFSET + 1],
+            header[JOURNAL_HEADER_TARGET_LBA_OFFSET + 2],
+            header[JOURNAL_HEADER_TARGET_LBA_OFFSET + 3],
+        ]);
+        let shadow_crc = u32::from_le_bytes([
+            header[JOURNAL_HEADER_SHADOW_CRC32_OFFSET],
+            header[JOURNAL_HEADER_SHADOW_CRC32_OFFSET + 1],
+            header[JOURNAL_HEADER_SHADOW_CRC32_OFFSET + 2],
+            header[JOURNAL_HEADER_SHADOW_CRC32_OFFSET + 3],
+        ]);
+        Ok((state, target_lba, shadow_crc))
+    }
+
+    async fn write_header_fields(
+        &mut self,
+        state: u8,
+        target_lba: u32,
+        shadow_crc: u32,
+    ) -> Result<(), StorageError> {
+        let header = Self::encode_header(state, target_lba, shadow_crc);
+        let header_crc = Self::crc32(&header);
+        self.backend
+            .write_bytes(self.journal_header_address(0), &header)
+            .await?;
         self.backend
             .write_bytes(
-                self.journal_header_address(JOURNAL_HEADER_TARGET_LBA_OFFSET),
-                &lba.to_le_bytes(),
+                self.journal_header_address(JOURNAL_HEADER_HEADER_CRC32_OFFSET),
+                &header_crc.to_le_bytes(),
             )
             .await
+    }
+
+    async fn validate_header_crc(&mut self) -> Result<bool, StorageError> {
+        let mut header = [0u8; JOURNAL_HEADER_DATA_LEN];
+        self.backend
+            .read_bytes(self.journal_header_address(0), &mut header)
+            .await?;
+
+        let expected = self.read_journal_header_crc32().await?;
+        Ok(Self::crc32(&header) == expected)
+    }
+
+    fn fallback_protected_lba_range(&self) -> LbaRange {
+        LbaRange::empty()
     }
 
     async fn recover_pending_metadata_write(&mut self) -> Result<(), StorageError> {
@@ -131,10 +246,18 @@ where
 
         let target_lba = self.read_journal_target_lba().await?;
         if self.is_logical_lba(target_lba) && self.is_protected_lba(target_lba) {
+            let expected_crc = self.read_journal_shadow_crc32().await?;
             let mut shadow = [0u8; BLOCK_SIZE];
             self.backend
                 .read_physical_block(self.journal_shadow_lba, &mut shadow)
                 .await?;
+
+            if Self::crc32(&shadow) != expected_crc {
+                // Availability-first policy: discard broken transaction and continue boot.
+                self.write_journal_state(JOURNAL_STATE_CLEAN).await?;
+                return Ok(());
+            }
+
             self.backend
                 .write_physical_block(self.logical_to_physical_lba(target_lba), &shadow)
                 .await?;
@@ -148,6 +271,7 @@ where
 
         self.write_journal_state(JOURNAL_STATE_CLEAN).await?;
         self.write_journal_target_lba(block_index).await?;
+        self.write_journal_shadow_crc32(Self::crc32(data)).await?;
 
         self.backend
             .write_physical_block(self.journal_shadow_lba, data)
@@ -171,7 +295,7 @@ where
 
         let (partition_start, partition_blocks) = self.parse_partition_geometry(&mbr);
         if partition_blocks == 0 || partition_start >= self.logical_block_count {
-            return Ok(LbaRange::empty());
+            return Ok(self.fallback_protected_lba_range());
         }
 
         let mut boot_sector = [0u8; BLOCK_SIZE];
@@ -180,12 +304,12 @@ where
             .await?;
 
         if boot_sector[510] != 0x55 || boot_sector[511] != 0xAA {
-            return Ok(LbaRange::empty());
+            return Ok(self.fallback_protected_lba_range());
         }
 
         let bytes_per_sector = u16::from_le_bytes([boot_sector[11], boot_sector[12]]) as u32;
         if bytes_per_sector != BLOCK_SIZE as u32 {
-            return Ok(LbaRange::empty());
+            return Ok(self.fallback_protected_lba_range());
         }
 
         let reserved_sectors = u16::from_le_bytes([boot_sector[14], boot_sector[15]]) as u32;
@@ -201,7 +325,7 @@ where
         };
 
         if fat_count == 0 || fat_sectors == 0 {
-            return Ok(LbaRange::empty());
+            return Ok(self.fallback_protected_lba_range());
         }
 
         let root_dir_sectors = (root_dir_entries * 32).div_ceil(BLOCK_SIZE as u32);
@@ -212,7 +336,7 @@ where
         let end = min(start.saturating_add(protected_len), self.logical_block_count);
 
         if start >= end {
-            Ok(LbaRange::empty())
+            Ok(self.fallback_protected_lba_range())
         } else {
             Ok(LbaRange {
                 start,

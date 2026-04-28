@@ -19,6 +19,13 @@ pub type HardwareStorage = MetadataJournalStorage<
     FeRam<FramSpi<'static, Output<'static>, Output<'static>, Output<'static>, Output<'static>>>,
 >;
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum HardwareInitError {
+    MissingResource(&'static str),
+    VolumeInitFailed,
+    JournalInitFailed,
+}
+
 pub struct HardwareParts {
     spi: Option<Spi<'static, Async, Master>>,
     cs0: Option<Output<'static>>,
@@ -73,13 +80,28 @@ pub fn init_hardware_parts(p: Peripherals) -> HardwareParts {
     }
 }
 
-pub async fn init_storage(parts: &mut HardwareParts) -> HardwareStorage {
+pub async fn init_storage(parts: &mut HardwareParts) -> Result<HardwareStorage, HardwareInitError> {
     let fram_spi = FramSpi::new(
-        parts.spi.take().expect("SPI already consumed"),
-        parts.cs0.take().expect("CS0 already consumed"),
-        parts.cs1.take().expect("CS1 already consumed"),
-        parts.cs2.take().expect("CS2 already consumed"),
-        parts.cs3.take().expect("CS3 already consumed"),
+        parts
+            .spi
+            .take()
+            .ok_or(HardwareInitError::MissingResource("SPI already consumed"))?,
+        parts
+            .cs0
+            .take()
+            .ok_or(HardwareInitError::MissingResource("CS0 already consumed"))?,
+        parts
+            .cs1
+            .take()
+            .ok_or(HardwareInitError::MissingResource("CS1 already consumed"))?,
+        parts
+            .cs2
+            .take()
+            .ok_or(HardwareInitError::MissingResource("CS2 already consumed"))?,
+        parts
+            .cs3
+            .take()
+            .ok_or(HardwareInitError::MissingResource("CS3 already consumed"))?,
     );
 
     let mut fram = FeRam::new(fram_spi);
@@ -111,22 +133,35 @@ pub async fn init_storage(parts: &mut HardwareParts) -> HardwareStorage {
     {
         Ok(true) => rprintln!("Initialized FAT12 volume for Windows"),
         Ok(false) => rprintln!("FAT12 volume already present"),
-        Err(_) => rprintln!("Volume initialization failed"),
+        Err(e) => {
+            rprintln!("Volume initialization failed: {:?}", e);
+            return Err(HardwareInitError::VolumeInitFailed);
+        }
     }
 
     let mut storage = MetadataJournalStorage::new(fram);
-    if storage.initialize().await.is_err() {
-        rprintln!("Metadata journal initialization failed");
+    if let Err(e) = storage.initialize().await {
+        rprintln!("Metadata journal initialization failed: {:?}", e);
+        return Err(HardwareInitError::JournalInitFailed);
     }
 
-    storage
+    Ok(storage)
 }
 
-pub fn init_usb_driver(parts: &mut HardwareParts) -> stm32_usb::Driver<'static, peripherals::USB> {
-    stm32_usb::Driver::new(
-        parts.usb.take().expect("USB peripheral already consumed"),
+pub fn init_usb_driver(parts: &mut HardwareParts) -> Result<stm32_usb::Driver<'static, peripherals::USB>, HardwareInitError> {
+    Ok(stm32_usb::Driver::new(
+        parts
+            .usb
+            .take()
+            .ok_or(HardwareInitError::MissingResource("USB peripheral already consumed"))?,
         init::Irqs,
-        parts.usb_dp.take().expect("USB DP already consumed"),
-        parts.usb_dm.take().expect("USB DM already consumed"),
-    )
+        parts
+            .usb_dp
+            .take()
+            .ok_or(HardwareInitError::MissingResource("USB DP already consumed"))?,
+        parts
+            .usb_dm
+            .take()
+            .ok_or(HardwareInitError::MissingResource("USB DM already consumed"))?,
+    ))
 }

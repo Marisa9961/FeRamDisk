@@ -261,7 +261,7 @@ fn read10_storage_error_maps_sense_and_stalls_in() {
 
     let resp = sense.to_response();
     assert_eq!(outcome.csw.status, CSW_STATUS_FAILED);
-    assert_eq!(outcome.stall_after_csw, StallAfterCsw::In);
+    assert_eq!(outcome.stall_before_csw, StallAfterCsw::In);
     assert_eq!(resp[2] & 0x0F, 0x03);
 }
 
@@ -288,7 +288,12 @@ fn read10_sends_zlp_on_short_aligned_in_transfer() {
     );
 
     assert_eq!(outcome.csw.status, CSW_STATUS_PASSED);
-    assert_eq!(in_ep.writes().last().cloned().unwrap_or_default(), Vec::<u8>::new());
+    let writes = in_ep.writes();
+    assert_eq!(writes.len(), 9, "should have 8 data packets + 1 ZLP");
+    for packet in &writes[..8] {
+        assert_eq!(packet.len(), USB_PACKET_SIZE, "first 8 packets must be full-size");
+    }
+    assert!(writes[8].is_empty(), "9th packet must be ZLP");
 }
 
 fn queue_write_payload(out_ep: &mut MockEndpoint, payload: &[u8]) {
@@ -469,6 +474,7 @@ fn write10_write_protect_returns_data_protect_sense() {
 
     let resp = sense.to_response();
     assert_eq!(outcome.csw.status, CSW_STATUS_FAILED);
+    assert_eq!(outcome.stall_before_csw, StallAfterCsw::Out);
     assert_eq!(resp[2] & 0x0F, 0x07);
 }
 
@@ -522,6 +528,7 @@ fn request_sense_returns_and_clears_sense() {
         bad_cbw,
     );
     assert_eq!(bad_outcome.csw.status, CSW_STATUS_FAILED);
+    in_ep.take_writes();
 
     let req_sense = build_cbw(SCSI_REQUEST_SENSE, 18, 0x80, 6, |cmd| {
         cmd[4] = 18;
@@ -633,7 +640,11 @@ fn mode_sense_unsupported_page_returns_illegal_field() {
         &mut prevent,
         mode6,
     );
+    let resp6 = sense.to_response();
     assert_eq!(out6.csw.status, CSW_STATUS_FAILED);
+    assert_eq!(resp6[2] & 0x0F, 0x05);
+    assert_eq!(resp6[12], 0x24);
+    assert_eq!(resp6[15] & 0xC0, 0xC0);
 
     let mode10 = build_cbw(SCSI_MODE_SENSE_10, 28, 0x80, 10, |cmd| {
         cmd[2] = 0x01;
@@ -647,7 +658,11 @@ fn mode_sense_unsupported_page_returns_illegal_field() {
         &mut prevent,
         mode10,
     );
+    let resp10 = sense.to_response();
     assert_eq!(out10.csw.status, CSW_STATUS_FAILED);
+    assert_eq!(resp10[2] & 0x0F, 0x05);
+    assert_eq!(resp10[12], 0x24);
+    assert_eq!(resp10[15] & 0xC0, 0xC0);
 }
 
 #[test]

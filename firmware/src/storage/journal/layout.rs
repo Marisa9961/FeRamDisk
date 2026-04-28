@@ -8,6 +8,8 @@ pub(super) const JOURNAL_MAGIC: [u8; 3] = *b"JNL";
 pub(super) const JOURNAL_HEADER_STATE_OFFSET: usize = 0;
 pub(super) const JOURNAL_HEADER_MAGIC_OFFSET: usize = 1;
 pub(super) const JOURNAL_HEADER_TARGET_LBA_OFFSET: usize = 4;
+pub(super) const JOURNAL_HEADER_SHADOW_CRC32_OFFSET: usize = 8;
+pub(super) const JOURNAL_HEADER_HEADER_CRC32_OFFSET: usize = 12;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) struct LbaRange {

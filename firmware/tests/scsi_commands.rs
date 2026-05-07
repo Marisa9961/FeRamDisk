@@ -34,6 +34,20 @@ fn write10_cbw(lba: u32, blocks: u16, expected_len: u32) -> Cbw {
     })
 }
 
+fn read12_cbw(lba: u32, blocks: u32, expected_len: u32) -> Cbw {
+    build_cbw(0xA8, expected_len, 0x80, 12, |cmd| {
+        cmd[2..6].copy_from_slice(&lba.to_be_bytes());
+        cmd[6..10].copy_from_slice(&blocks.to_be_bytes());
+    })
+}
+
+fn write12_cbw(lba: u32, blocks: u32, expected_len: u32) -> Cbw {
+    build_cbw(0xAA, expected_len, 0x00, 12, |cmd| {
+        cmd[2..6].copy_from_slice(&lba.to_be_bytes());
+        cmd[6..10].copy_from_slice(&blocks.to_be_bytes());
+    })
+}
+
 fn flatten_packets(packets: &[Vec<u8>]) -> Vec<u8> {
     packets.iter().flat_map(|packet| packet.clone()).collect()
 }
@@ -755,4 +769,334 @@ fn unknown_opcode_sets_invalid_command_sense() {
     let resp = sense.to_response();
     assert_eq!(outcome.csw.status, CSW_STATUS_FAILED);
     assert_eq!(resp[12], 0x20);
+}
+
+#[test]
+// Verify REPORT LUNS returns a single LUN 0 descriptor.
+fn report_luns_returns_lun_zero_descriptor() {
+    let _guard = test_lock();
+
+    let mut storage = RamStorage::new(2);
+    let mut out_ep = MockEndpoint::new();
+    let mut in_ep = MockEndpoint::new();
+    let mut sense = SenseData::good();
+    let mut prevent = false;
+
+    let cbw = build_cbw(0xA0, 16, 0x80, 12, |cmd| {
+        cmd[6..10].copy_from_slice(&16u32.to_be_bytes());
+    });
+
+    let outcome = run_cmd(&mut storage, &mut out_ep, &mut in_ep, &mut sense, &mut prevent, cbw);
+    let payload = flatten_packets(in_ep.writes());
+
+    assert_eq!(outcome.csw.status, CSW_STATUS_PASSED);
+    assert_eq!(u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]), 8);
+    assert_eq!(&payload[8..16], &[0u8; 8]);
+}
+
+#[test]
+// Verify FORMAT UNIT is accepted as a no-op.
+fn format_unit_is_accepted() {
+    let _guard = test_lock();
+
+    let mut storage = RamStorage::new(2);
+    let mut out_ep = MockEndpoint::new();
+    let mut in_ep = MockEndpoint::new();
+    let mut sense = SenseData::good();
+    let mut prevent = false;
+
+    let cbw = build_cbw(0x04, 0, 0x00, 6, |_| {});
+    let outcome = run_cmd(&mut storage, &mut out_ep, &mut in_ep, &mut sense, &mut prevent, cbw);
+
+    assert_eq!(outcome.csw.status, CSW_STATUS_PASSED);
+}
+
+#[test]
+// Verify SEND DIAGNOSTIC passes when PF and SelfTest are not requested.
+fn send_diagnostic_noop_returns_success() {
+    let _guard = test_lock();
+
+    let mut storage = RamStorage::new(2);
+    let mut out_ep = MockEndpoint::new();
+    let mut in_ep = MockEndpoint::new();
+    let mut sense = SenseData::good();
+    let mut prevent = false;
+
+    let cbw = build_cbw(0x1D, 0, 0x00, 6, |_| {});
+    let outcome = run_cmd(&mut storage, &mut out_ep, &mut in_ep, &mut sense, &mut prevent, cbw);
+
+    assert_eq!(outcome.csw.status, CSW_STATUS_PASSED);
+}
+
+#[test]
+// Verify SEND DIAGNOSTIC rejects PF or SelfTest usage with INVALID FIELD sense.
+fn send_diagnostic_with_pf_or_self_test_returns_sense() {
+    let _guard = test_lock();
+
+    let mut storage = RamStorage::new(2);
+    let mut out_ep = MockEndpoint::new();
+    let mut in_ep = MockEndpoint::new();
+    let mut sense = SenseData::good();
+    let mut prevent = false;
+
+    let cbw = build_cbw(0x1D, 0, 0x00, 6, |cmd| {
+        cmd[1] = 0x14;
+    });
+    let outcome = run_cmd(&mut storage, &mut out_ep, &mut in_ep, &mut sense, &mut prevent, cbw);
+
+    let resp = sense.to_response();
+    assert_eq!(outcome.csw.status, CSW_STATUS_FAILED);
+    assert_eq!(resp[12], 0x24);
+}
+
+#[test]
+// Verify WRITE SAME and UNMAP are accepted as no-op compatibility commands.
+fn write_same_and_unmap_are_accepted() {
+    let _guard = test_lock();
+
+    let mut storage = RamStorage::new(2);
+    let mut out_ep = MockEndpoint::new();
+    let mut in_ep = MockEndpoint::new();
+    let mut sense = SenseData::good();
+    let mut prevent = false;
+
+    for opcode in [0x41, 0x42] {
+        let cbw = build_cbw(opcode, 0, 0x00, 10, |_| {});
+        let outcome = run_cmd(&mut storage, &mut out_ep, &mut in_ep, &mut sense, &mut prevent, cbw);
+        assert_eq!(outcome.csw.status, CSW_STATUS_PASSED);
+    }
+}
+
+#[test]
+// Verify READ(12) maps to the existing block read path.
+fn read12_maps_to_read10_behavior() {
+    let _guard = test_lock();
+
+    let mut storage = RamStorage::new(16);
+    storage.set_block(3, [0x7Cu8; BLOCK_SIZE]);
+
+    let mut out_ep = MockEndpoint::new();
+    let mut in_ep = MockEndpoint::new();
+    let mut sense = SenseData::good();
+    let mut prevent = false;
+
+    let outcome = run_cmd(
+        &mut storage,
+        &mut out_ep,
+        &mut in_ep,
+        &mut sense,
+        &mut prevent,
+        read12_cbw(3, 1, BLOCK_SIZE as u32),
+    );
+
+    assert_eq!(outcome.csw.status, CSW_STATUS_PASSED);
+    assert_eq!(flatten_packets(in_ep.writes()), vec![0x7Cu8; BLOCK_SIZE]);
+}
+
+#[test]
+// Verify WRITE(12) maps to the existing block write path.
+fn write12_maps_to_write10_behavior() {
+    let _guard = test_lock();
+
+    let mut storage = RamStorage::new(16);
+    let mut out_ep = MockEndpoint::new();
+    queue_write_payload(&mut out_ep, &[0xA5; BLOCK_SIZE]);
+
+    let mut in_ep = MockEndpoint::new();
+    let mut sense = SenseData::good();
+    let mut prevent = false;
+
+    let outcome = run_cmd(
+        &mut storage,
+        &mut out_ep,
+        &mut in_ep,
+        &mut sense,
+        &mut prevent,
+        write12_cbw(4, 1, BLOCK_SIZE as u32),
+    );
+
+    assert_eq!(outcome.csw.status, CSW_STATUS_PASSED);
+    assert_eq!(storage.block(4), [0xA5; BLOCK_SIZE]);
+}
+
+#[test]
+// Verify SERVICE ACTION IN/OUT requests are rejected with INVALID FIELD sense.
+fn service_action_requests_return_invalid_field() {
+    let _guard = test_lock();
+
+    let mut storage = RamStorage::new(2);
+    let mut out_ep = MockEndpoint::new();
+    let mut in_ep = MockEndpoint::new();
+    let mut sense = SenseData::good();
+    let mut prevent = false;
+
+    for opcode in [0x9E, 0x9F] {
+        let cbw = build_cbw(opcode, 0, 0x00, 12, |_| {});
+        let outcome = run_cmd(&mut storage, &mut out_ep, &mut in_ep, &mut sense, &mut prevent, cbw);
+        let resp = sense.to_response();
+        assert_eq!(outcome.csw.status, CSW_STATUS_FAILED);
+        assert_eq!(resp[12], 0x24);
+    }
+}
+
+#[test]
+// Verify storage HardwareError during read maps to unrecovered read error sense.
+fn read10_hardware_error_maps_to_read_error_sense() {
+    let _guard = test_lock();
+
+    let mut storage = RamStorage::new(8);
+    storage.inject_read_error_at(2, StorageError::HardwareError);
+
+    let mut out_ep = MockEndpoint::new();
+    let mut in_ep = MockEndpoint::new();
+    let mut sense = SenseData::good();
+    let mut prevent = false;
+
+    let outcome = run_cmd(
+        &mut storage,
+        &mut out_ep,
+        &mut in_ep,
+        &mut sense,
+        &mut prevent,
+        read10_cbw(2, 1, BLOCK_SIZE as u32),
+    );
+
+    let resp = sense.to_response();
+    assert_eq!(outcome.csw.status, CSW_STATUS_FAILED);
+    assert_eq!(resp[2] & 0x0F, 0x04);
+    assert_eq!(resp[12], 0x44);
+}
+
+#[test]
+// Verify storage MediumError (bad sectors) maps correctly during multi-block reads.
+fn read10_medium_error_on_block_sequence() {
+    let _guard = test_lock();
+
+    let mut storage = RamStorage::new(8);
+    storage.set_block(0, [0x00; BLOCK_SIZE]);
+    storage.set_block(1, [0x11; BLOCK_SIZE]);
+    storage.inject_read_error_at(2, StorageError::MediumError);
+
+    let mut out_ep = MockEndpoint::new();
+    let mut in_ep = MockEndpoint::new();
+    let mut sense = SenseData::good();
+    let mut prevent = false;
+
+    let outcome = run_cmd(
+        &mut storage,
+        &mut out_ep,
+        &mut in_ep,
+        &mut sense,
+        &mut prevent,
+        read10_cbw(0, 3, 3 * BLOCK_SIZE as u32),
+    );
+
+    let resp = sense.to_response();
+    assert_eq!(outcome.csw.status, CSW_STATUS_FAILED);
+    assert_eq!(resp[2] & 0x0F, 0x03);
+    assert_eq!(resp[12], 0x11);
+}
+
+#[test]
+// Verify write to write-protected media returns DATA PROTECT sense (0x07/0x27).
+fn write10_write_protect_sense_encoding() {
+    let _guard = test_lock();
+
+    let mut storage = RamStorage::new(8);
+    storage.set_write_protected(true);
+
+    let mut out_ep = MockEndpoint::new();
+    let mut in_ep = MockEndpoint::new();
+    let mut sense = SenseData::good();
+    let mut prevent = false;
+
+    let cbw = write10_cbw(0, 1, BLOCK_SIZE as u32);
+    let outcome = run_cmd(
+        &mut storage,
+        &mut out_ep,
+        &mut in_ep,
+        &mut sense,
+        &mut prevent,
+        cbw,
+    );
+
+    let resp = sense.to_response();
+    assert_eq!(outcome.csw.status, CSW_STATUS_FAILED);
+    assert_eq!(resp[2] & 0x0F, 0x07);
+    assert_eq!(resp[12], 0x27);
+}
+
+#[test]
+// Verify storage NotReady error maps to NOT READY sense during command execution.
+fn storage_not_ready_blocks_read_and_write() {
+    let _guard = test_lock();
+
+    let mut storage = RamStorage::new(8);
+    storage.set_ready(false);
+
+    let mut out_ep = MockEndpoint::new();
+    let mut in_ep = MockEndpoint::new();
+    let mut sense = SenseData::good();
+    let mut prevent = false;
+
+    // Test READ failure
+    let read_outcome = run_cmd(
+        &mut storage,
+        &mut out_ep,
+        &mut in_ep,
+        &mut sense,
+        &mut prevent,
+        read10_cbw(0, 1, BLOCK_SIZE as u32),
+    );
+
+    let read_resp = sense.to_response();
+    assert_eq!(read_outcome.csw.status, CSW_STATUS_FAILED);
+    assert_eq!(read_resp[2] & 0x0F, 0x02);
+    assert_eq!(read_resp[12], 0x04);
+}
+
+#[test]
+// Verify multiple error conditions in sequence are independently handled.
+fn sequential_errors_maintain_sense_state() {
+    let _guard = test_lock();
+
+    let mut storage = RamStorage::new(16);
+    storage.inject_read_error_at(0, StorageError::HardwareError);
+    storage.inject_write_error_at(1, StorageError::WriteProtect);
+
+    let mut out_ep = MockEndpoint::new();
+    let mut in_ep = MockEndpoint::new();
+    let mut sense = SenseData::good();
+    let mut prevent = false;
+
+    // First: READ error
+    let outcome1 = run_cmd(
+        &mut storage,
+        &mut out_ep,
+        &mut in_ep,
+        &mut sense,
+        &mut prevent,
+        read10_cbw(0, 1, BLOCK_SIZE as u32),
+    );
+    let resp1 = sense.to_response();
+    assert_eq!(outcome1.csw.status, CSW_STATUS_FAILED);
+    assert_eq!(resp1[12], 0x44);
+
+    in_ep.take_writes();
+    out_ep = MockEndpoint::new();
+
+    // Second: WRITE error to different LBA
+    let payload = vec![0xAA; BLOCK_SIZE];
+    queue_write_payload(&mut out_ep, &payload);
+    let outcome2 = run_cmd(
+        &mut storage,
+        &mut out_ep,
+        &mut in_ep,
+        &mut sense,
+        &mut prevent,
+        write10_cbw(1, 1, BLOCK_SIZE as u32),
+    );
+    let resp2 = sense.to_response();
+    assert_eq!(outcome2.csw.status, CSW_STATUS_FAILED);
+    assert_eq!(resp2[12], 0x27);
 }

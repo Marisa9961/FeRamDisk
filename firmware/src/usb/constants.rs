@@ -10,18 +10,27 @@ pub(crate) const CSW_STATUS_FAILED: u8 = 1;
 pub(crate) const CSW_STATUS_PHASE_ERROR: u8 = 2;
 
 pub(crate) const SCSI_TEST_UNIT_READY: u8 = 0x00;
+pub(crate) const SCSI_FORMAT_UNIT: u8 = 0x04;
 pub(crate) const SCSI_REQUEST_SENSE: u8 = 0x03;
+pub(crate) const SCSI_SEND_DIAGNOSTIC: u8 = 0x1D;
 pub(crate) const SCSI_INQUIRY: u8 = 0x12;
 pub(crate) const SCSI_MODE_SENSE_6: u8 = 0x1A;
 pub(crate) const SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL: u8 = 0x1E;
+pub(crate) const SCSI_REPORT_LUNS: u8 = 0xA0;
 pub(crate) const SCSI_READ_FORMAT_CAPACITIES: u8 = 0x23;
 pub(crate) const SCSI_READ_CAPACITY_10: u8 = 0x25;
 pub(crate) const SCSI_READ_10: u8 = 0x28;
+pub(crate) const SCSI_READ_12: u8 = 0xA8;
 pub(crate) const SCSI_WRITE_10: u8 = 0x2A;
+pub(crate) const SCSI_WRITE_12: u8 = 0xAA;
+pub(crate) const SCSI_WRITE_SAME_10: u8 = 0x41;
+pub(crate) const SCSI_UNMAP: u8 = 0x42;
 pub(crate) const SCSI_VERIFY_10: u8 = 0x2F;
 pub(crate) const SCSI_SYNCHRONIZE_CACHE_10: u8 = 0x35;
 pub(crate) const SCSI_MODE_SENSE_10: u8 = 0x5A;
 pub(crate) const SCSI_START_STOP_UNIT: u8 = 0x1B;
+pub(crate) const SCSI_SERVICE_ACTION_IN_16: u8 = 0x9E;
+pub(crate) const SCSI_SERVICE_ACTION_OUT_16: u8 = 0x9F;
 
 pub(crate) const SENSE_NOT_READY: u8 = 0x02;
 pub(crate) const SENSE_MEDIUM_ERROR: u8 = 0x03;

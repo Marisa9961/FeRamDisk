@@ -480,6 +480,38 @@ fn recovery_rewrites_header_on_header_crc_mismatch() {
     assert_eq!(&header[1..4], JOURNAL_MAGIC.as_slice());
     assert_eq!(u32::from_le_bytes([header[12], header[13], header[14], header[15]]), crc32(&header[..12]));
 }
+
+#[test]
+// Simulate power loss after shadow block written but before commit marker; recovery must not apply shadow.
+fn recovery_ignores_shadow_without_commit() {
+    let _guard = test_lock();
+
+    let backend = SharedRamBackend::new(24);
+    {
+        let state = backend.inner();
+        let mut state = state.lock().expect("backend poisoned");
+        let logical_blocks = 24 - JOURNAL_RESERVED_BLOCKS;
+        install_valid_fat12_layout(&mut state, logical_blocks);
+
+        // Write a shadow block but leave journal state CLEAN (no commit)
+        let shadow = [0x5Fu8; BLOCK_SIZE];
+        state.set_physical_block(1, shadow);
+        // Ensure header is CLEAN
+        write_journal_header(&mut state, JOURNAL_STATE_CLEAN, 2, crc32(&shadow));
+
+        // Target block should be different
+        state.set_physical_block(logical_to_physical(2), [0xAAu8; BLOCK_SIZE]);
+    }
+
+    let mut storage = MetadataJournalStorage::new(backend.clone());
+    run_async(async { storage.initialize().await.expect("initialize should continue") });
+
+    let state = backend.inner();
+    let state = state.lock().expect("backend poisoned");
+    // Since there was no commit, the shadow must not be applied
+    assert_eq!(state.physical_block(logical_to_physical(2)), [0xAAu8; BLOCK_SIZE]);
+}
+
 #[test]
 // Verify shadow block write failures during journaled writes are propagated.
 fn journal_write_propagates_shadow_write_error() {

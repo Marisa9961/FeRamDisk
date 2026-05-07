@@ -10,11 +10,13 @@ use crate::usb::constants::{
     CSW_STATUS_FAILED, CSW_STATUS_PASSED, CSW_STATUS_PHASE_ERROR,
     DATA_OUT_TIMEOUT_MS, OVERFLOW_DRAIN_MAX_PACKETS, OVERFLOW_DRAIN_TIMEOUT_MS,
     SENSE_ADDITIONAL_LENGTH, SENSE_FIXED_RESPONSE_LEN,
-    SCSI_INQUIRY, SCSI_MODE_SENSE_10, SCSI_MODE_SENSE_6, SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL,
-    SCSI_READ_10, SCSI_READ_CAPACITY_10, SCSI_READ_FORMAT_CAPACITIES, SCSI_REQUEST_SENSE,
-    SCSI_START_STOP_UNIT, SCSI_SYNCHRONIZE_CACHE_10, SCSI_TEST_UNIT_READY, SCSI_VERIFY_10,
-    SCSI_WRITE_10, SENSE_DATA_PROTECT, SENSE_HARDWARE_ERROR, SENSE_ILLEGAL_REQUEST,
-    SENSE_MEDIUM_ERROR, SENSE_NOT_READY, USB_PACKET_SIZE,
+    SCSI_FORMAT_UNIT, SCSI_INQUIRY, SCSI_MODE_SENSE_10, SCSI_MODE_SENSE_6,
+    SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL, SCSI_READ_10, SCSI_READ_12, SCSI_READ_CAPACITY_10,
+    SCSI_READ_FORMAT_CAPACITIES, SCSI_REPORT_LUNS, SCSI_REQUEST_SENSE, SCSI_SEND_DIAGNOSTIC,
+    SCSI_SERVICE_ACTION_IN_16, SCSI_SERVICE_ACTION_OUT_16, SCSI_START_STOP_UNIT,
+    SCSI_SYNCHRONIZE_CACHE_10, SCSI_TEST_UNIT_READY, SCSI_UNMAP, SCSI_VERIFY_10,
+    SCSI_WRITE_10, SCSI_WRITE_12, SCSI_WRITE_SAME_10, SENSE_DATA_PROTECT, SENSE_HARDWARE_ERROR,
+    SENSE_ILLEGAL_REQUEST, SENSE_MEDIUM_ERROR, SENSE_NOT_READY, USB_PACKET_SIZE,
 };
 use crate::usb::core::{send_in_data, Cbw, Csw, DataDirection, DataEndpoint};
 use crate::usb::scsi::{
@@ -222,6 +224,31 @@ where
                 status = CSW_STATUS_FAILED;
             }
         }
+        SCSI_REPORT_LUNS => {
+            if has_phase_mismatch(cbw, DataDirection::In) {
+                return Ok(phase_error(cbw));
+            }
+
+            let allocation_length = u32::from_be_bytes([
+                cbw.command[6],
+                cbw.command[7],
+                cbw.command[8],
+                cbw.command[9],
+            ]);
+            let response = [
+                0x00, 0x00, 0x00, 0x08,
+                0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+            ];
+            transferred = send_in_data(
+                in_ep,
+                &response,
+                min(expected_length, allocation_length),
+                cbw.expects_in(),
+            )
+            .await?;
+        }
         SCSI_INQUIRY => {
             if has_phase_mismatch(cbw, DataDirection::In) {
                 return Ok(phase_error(cbw));
@@ -331,7 +358,31 @@ where
 
             *prevent_medium_removal = cbw.command[4] & 0x01 != 0;
         }
+        SCSI_FORMAT_UNIT => {
+            if has_phase_mismatch(cbw, DataDirection::None) {
+                return Ok(phase_error(cbw));
+            }
+
+            // No low-level format action required for FeRAM media.
+        }
+        SCSI_SEND_DIAGNOSTIC => {
+            if has_phase_mismatch(cbw, DataDirection::None) {
+                return Ok(phase_error(cbw));
+            }
+
+            let pf = cbw.command[1] & 0x10 != 0;
+            let self_test = cbw.command[1] & 0x04 != 0;
+            if pf || self_test {
+                *sense = SenseData::illegal_field_in_cdb(1);
+                status = CSW_STATUS_FAILED;
+            }
+        }
         SCSI_SYNCHRONIZE_CACHE_10 | SCSI_VERIFY_10 | SCSI_START_STOP_UNIT => {
+            if has_phase_mismatch(cbw, DataDirection::None) {
+                return Ok(phase_error(cbw));
+            }
+        }
+        SCSI_WRITE_SAME_10 | SCSI_UNMAP => {
             if has_phase_mismatch(cbw, DataDirection::None) {
                 return Ok(phase_error(cbw));
             }
@@ -346,6 +397,32 @@ where
                 status = CSW_STATUS_FAILED;
             } else {
                 let (lba, block_count) = parse_read_write_10(&cbw.command);
+                if !block_range_valid(storage, lba, block_count) {
+                    *sense = SenseData::lba_out_of_range(lba);
+                    status = CSW_STATUS_FAILED;
+                } else {
+                    match read_blocks(storage, in_ep, lba, block_count, expected_length, cbw.expects_in()).await {
+                        Ok(bytes) => transferred = bytes,
+                        Err(TransferError::Endpoint(error)) => return Err(error),
+                        Err(TransferError::Storage(error)) => {
+                            *sense = SenseData::from_storage_error(error, false);
+                            status = CSW_STATUS_FAILED;
+                            stall_before_csw = StallAfterCsw::In;
+                        }
+                    }
+                }
+            }
+        }
+        SCSI_READ_12 => {
+            if has_phase_mismatch(cbw, DataDirection::In) {
+                return Ok(phase_error(cbw));
+            }
+
+            if !storage.is_ready() {
+                *sense = SenseData::not_ready_initializing();
+                status = CSW_STATUS_FAILED;
+            } else {
+                let (lba, block_count) = parse_read_write_12(&cbw.command);
                 if !block_range_valid(storage, lba, block_count) {
                     *sense = SenseData::lba_out_of_range(lba);
                     status = CSW_STATUS_FAILED;
@@ -407,6 +484,56 @@ where
                     }
                 }
             }
+        }
+        SCSI_WRITE_12 => {
+            if has_phase_mismatch(cbw, DataDirection::Out) {
+                return Ok(phase_error(cbw));
+            }
+
+            if !storage.is_ready() {
+                *sense = SenseData::not_ready_initializing();
+                status = CSW_STATUS_FAILED;
+            } else if storage.is_write_protected() {
+                *sense = SenseData::from_storage_error(StorageError::WriteProtect, true);
+                status = CSW_STATUS_FAILED;
+            } else {
+                let (lba, block_count) = parse_read_write_12(&cbw.command);
+                if !block_range_valid(storage, lba, block_count) {
+                    *sense = SenseData::lba_out_of_range(lba);
+                    status = CSW_STATUS_FAILED;
+                } else {
+                    match write_blocks(storage, out_ep, lba, block_count, expected_length).await {
+                        Ok(transfer) => {
+                            transferred = transfer.written_bytes;
+
+                            let requested_bytes = block_count as u32 * BLOCK_SIZE as u32;
+                            let mismatch = transfer.short_packet
+                                || transfer.packet_overflow
+                                || transfer.written_bytes < requested_bytes
+                                || transfer.consumed_bytes < expected_length
+                                || expected_length != requested_bytes;
+
+                            if mismatch {
+                                *sense = SenseData::transfer_length_mismatch(
+                                    expected_length.saturating_sub(transfer.written_bytes),
+                                    7,
+                                );
+                                status = CSW_STATUS_FAILED;
+                            }
+                        }
+                        Err(TransferError::Endpoint(error)) => return Err(error),
+                        Err(TransferError::Storage(error)) => {
+                            *sense = SenseData::from_storage_error(error, true);
+                            status = CSW_STATUS_FAILED;
+                            stall_before_csw = StallAfterCsw::Out;
+                        }
+                    }
+                }
+            }
+        }
+        SCSI_SERVICE_ACTION_IN_16 | SCSI_SERVICE_ACTION_OUT_16 => {
+            *sense = SenseData::illegal_field_in_cdb(1);
+            status = CSW_STATUS_FAILED;
         }
         _ => {
             *sense = SenseData::illegal_request(ASC_INVALID_COMMAND_OPCODE);
@@ -665,6 +792,12 @@ where
 fn parse_read_write_10(command: &[u8; 16]) -> (u32, u16) {
     let lba = u32::from_be_bytes([command[2], command[3], command[4], command[5]]);
     let block_count = u16::from_be_bytes([command[7], command[8]]);
+    (lba, block_count)
+}
+
+fn parse_read_write_12(command: &[u8; 16]) -> (u32, u16) {
+    let lba = u32::from_be_bytes([command[2], command[3], command[4], command[5]]);
+    let block_count = u32::from_be_bytes([command[6], command[7], command[8], command[9]]) as u16;
     (lba, block_count)
 }
 

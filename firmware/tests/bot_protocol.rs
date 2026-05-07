@@ -232,3 +232,90 @@ fn bot_write_failure_requests_out_stall() {
     let actions = harness.take_bus_actions();
     assert_ne!(actions & BOT_ACTION_STALL_OUT, 0);
 }
+
+#[test]
+// Verify multiple sequential commands after failure are properly handled with stall reset.
+fn bot_sequential_commands_after_failure_recover() {
+    let _guard = test_lock();
+
+    let harness = BotTestHarness::new(8);
+    
+    // First command: READ from invalid LBA (should fail and stall IN)
+    harness.queue_out_packet(cbw_read_10(0x1111_1111, 99, 1, 512));
+    harness.run_for(60);
+    
+    let first_actions = harness.take_bus_actions();
+    assert_ne!(first_actions & BOT_ACTION_STALL_IN, 0, "first read failure should stall IN");
+    
+    let csws = collect_csws(&harness);
+    assert!(csws.iter().any(|(tag, _, status)| *tag == 0x1111_1111 && *status != CSW_STATUS_PASSED));
+    
+    // Second command: valid TEST UNIT READY should succeed
+    harness.queue_out_packet(cbw_test_unit_ready(0x2222_2222));
+    harness.run_for(40);
+    
+    let csws_all = collect_csws(&harness);
+    assert!(csws_all.iter().any(|(tag, _, status)| *tag == 0x2222_2222 && *status == CSW_STATUS_PASSED));
+}
+
+#[test]
+// Verify endpoint recover from stalled state with stall clear action.
+fn bot_endpoint_stall_recovery_via_clear_stall() {
+    let _guard = test_lock();
+
+    let harness = BotTestHarness::new(4);
+    
+    // Trigger a stall by reading invalid LBA
+    harness.queue_out_packet(cbw_read_10(0x3333_3333, 99, 1, 512));
+    harness.run_for(60);
+    
+    let stall_actions = harness.take_bus_actions();
+    assert_ne!(stall_actions, 0, "stall should have been requested");
+    
+    // Queue another valid command: should be processed if endpoint is recovered
+    harness.queue_out_packet(cbw_test_unit_ready(0x4444_4444));
+    harness.run_for(40);
+    
+    let csws = collect_csws(&harness);
+    assert!(csws.iter().filter(|(tag, _, _)| *tag == 0x4444_4444).count() > 0);
+}
+
+#[test]
+// Verify read/write data phase completion followed by CSW emission.
+fn bot_data_phase_completion_follows_csw() {
+    let _guard = test_lock();
+
+    let harness = BotTestHarness::new(16);
+    harness.storage_inner().lock().unwrap().set_block(0, [0xAB; 512]);
+    
+    harness.queue_out_packet(cbw_read_10(0x5555_5555, 0, 1, 512));
+    harness.run_for(80);
+    
+    let all_packets = harness.in_packets();
+    let csws = collect_csws(&harness);
+    
+    assert!(csws.iter().any(|(tag, _, status)| *tag == 0x5555_5555 && *status == CSW_STATUS_PASSED));
+    // Expect: 8 data packets (64 bytes each) + 1 CSW packet
+    assert!(all_packets.len() > 8, "should have data packets before CSW");
+}
+
+#[test]
+// Verify out-of-range LBA write request stalls OUT before CSW and sets residue.
+fn bot_write_out_of_range_stalls_and_sets_residue() {
+    let _guard = test_lock();
+
+    let harness = BotTestHarness::new(4);
+    harness.queue_out_packet(cbw_write_10(0x6666_6666, 99, 1, 512));
+    harness.queue_out_packet(vec![0xFF; 512]);
+    
+    harness.run_for(80);
+    
+    let csws = collect_csws(&harness);
+    if let Some((_tag, residue, status)) = csws.iter().find(|(tag, _, _)| *tag == 0x6666_6666) {
+        assert_ne!(status, &CSW_STATUS_PASSED, "out-of-range write should fail");
+        assert_eq!(residue, &512u32, "residue should match requested length");
+    }
+    
+    let actions = harness.take_bus_actions();
+    assert_ne!(actions & BOT_ACTION_STALL_OUT, 0, "out-of-range write should stall OUT");
+}

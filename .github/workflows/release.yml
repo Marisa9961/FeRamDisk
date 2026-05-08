@@ -1,0 +1,31 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '*'
+
+jobs:
+  test-and-release:
+    name: Test and Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: x86_64-unknown-linux-gnu
+
+      - name: Run tests
+        working-directory: firmware
+        run: cargo test --no-default-features --target x86_64-unknown-linux-gnu
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          # GitHub release action automatically includes source code as .zip and .tar.gz
+          # Since you only need source code, no `files` parameter is needed here.

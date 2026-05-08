@@ -9,6 +9,8 @@ jobs:
   test-and-release:
     name: Test and Release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout code

@@ -1,32 +1,56 @@
 # FeRamDisk: 基于 STM32G431 的铁电存储 U 盘
 
+![Rust](https://img.shields.io/badge/Lang-Rust-orange.svg) 
+![STM32](https://img.shields.io/badge/MCU-STM32G431-blue.svg) 
+![Embassy](https://img.shields.io/badge/Framework-Embassy-brightgreen.svg) 
+![KiCad](https://img.shields.io/badge/Hardware-KiCad-yellow.svg)
+
 ## 项目概述
-FeRamDisk 是一款基于 **STM32G431** 主控与 **MB85RS2MTA** 存储介质的专用闪存盘。不同于传统的 NAND Flash 存储方案，本项目利用铁电随机存取存储器（FeRAM）的物理特性，实现了极高的读写耐久性与近乎瞬时的随机访问能力。
+FeRamDisk 是一款基于 **STM32G431** 主控与 **MB85RS256** 存储介质的专用闪存盘。
 
-## 注意
+不同于传统的 NAND Flash 存储方案，本项目利用铁电随机存取存储器（FeRAM）的物理特性，实现了极高的读写耐久性与近乎瞬时的随机访问能力。
 
-### 1. 临时硬件适配说明
-当前分支/版本针对 **实验性硬件环境** 进行了底层驱动修改，与生产环境（4-Chip 256KB 原版）存在关键差异：
-* **目标芯片**: `MB85RS256BPNF` (32KB / 256K-bit)。
-* **物理配置**: 当前代码逻辑仅适配 **2 片级联** (Total 64KB)，而非原定的 4 片。
-* **寻址协议**: 已将 SPI 指令 Header 从 **4 字节 (24-bit 地址)** 缩减为 **3 字节 (16-bit 地址)**。
+详细介绍可移步至博客链接 [能存一辈子？自制FeRam铁电存储U盘！](https://marisa9961.github.io/2026/04/10/260408-FeRamDisk/)
 
-### 2. 代码合并禁忌 (Merge Warning)
-**严禁将硬件参数配置直接 Merge 回 `main` 主线。**
-在将 U 盘通用逻辑（如 USB MSC 协议栈、FAT12 读写优化）同步回主线时，请务必执行以下操作：
-* **保持主线常量**: `CHIP_SIZE_BYTES` 必须维持 `256 * 1024`，`ADDR_BYTES` 必须维持 `3`。
-* **推荐合并方式**: 
-    1.  使用 `git cherry-pick <commit_id>` 仅挑选功能性代码提交。
-    2.  或使用 `git checkout <branch> -- <file>` 针对性检出非配置类文件。
+![FeRamDisk_PCB](./docs/FeRamDisk_PCB.jpg)
 
-### 3. FAT12 布局变动
-由于物理存储空间从 1MB 骤减至 64KB/128KB，文件系统布局参数已做调整：
-* **保留扇区**: `RESERVED_SECTORS` 保持为 1。
-* **根目录条目**: 需关注 `ROOT_DIR_ENTRIES` 是否占用过多空间，当前逻辑可能导致数据区极小。
-* **校验**: 格式化后若电脑提示“容量错误”，请优先检查 `build_boot_sector` 中的 `total_sectors` 字段是否与物理芯片总块数对齐。
+## 功能介绍
 
-### 4. 硬件回归 Checklist
-当你换回 **MB85RS2MPNF** (256KB) 芯片时，必须还原以下逻辑：
-- `feram.rs` 中的 `read_on_chip` / `write_on_chip` 指令 Header 恢复为 4 字节（1 指令 + 3 地址）。
-- `CHIP_SIZE_BYTES` 恢复为 `262144`。
-- 重新运行 `ensure_mass_storage_volume()` 进行全盘初始化。
+1. **硬件设计开源**：提供完整的 Kicad 工程、原理图及制造文件，可直接打板生产。
+2. **USB 大容量存储设备固件设计**：基于 Rust embassy 异步框架，从零实现 SCSI 指令集与 BOT 协议，支持全平台免驱识别。
+3. **影子存储区防止文件系统崩溃**：利用日志机制抽象存储操作，保障意外断电及插拔时的数据一致性。
+
+## 快速上手
+
+项目固件采用 Rust 编写。构建前请确保已安装 Rust 工具链。
+
+```bash
+cd firmware
+
+# 编译固件（默认已启用 hardware feature）
+cargo build --release
+
+# 在主机上运行脱离硬件的单元测试（需关闭默认的硬件功能并指定主机平台）
+# 另外需要根据自己的开发环境选择正确的目标平台
+cargo test --no-default-features --target x86_64-pc-windows-msvc
+
+# 如果已配置 probe-rs 等烧录工具，可直接一键编译并烧录
+cargo run --release
+```
+
+## 项目构成
+
+- `hardware/`: 硬件设计目录（包含 Kicad 源工程、BOM 表及 Gerber 生产文件）。
+- `firmware/`: 核心固件目录（Rust 编写）。
+  - `src/usb/`: USB 核心协议栈（MSC / BOT / SCSI）的具体实现。
+  - `src/storage/`: 存储后端适配与事务日志系统（Journaling），确保块设备的高可靠读写。
+  - `src/drivers/`: SPI 通信底漆及 MB85RS256 铁电存储芯片的驱动层。
+  - `tests/`: 包含脱离硬件直接在 PC 端运行的协议栈软仿真测试环境。
+- `docs/`: 相关的项目说明与文档资源。
+
+## 贡献要点
+
+欢迎任何形式的讨论与代码贡献（Pull Request / Issue）：
+1. **固件开发**：PR 提交前，请确保能够通过 `tests/` 目录下的所有软仿真单元测试 (`cargo test`)。
+2. **硬件优化**：如有 PCB 布局或元器件替代方案，请提供原因及 Kicad 源文件的修改。
+3. **想法拓展**：欢迎探讨铁电特性（极快且无磨损限制）在微型数据记录器（Data Logger）等前沿领域的新用法。
